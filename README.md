@@ -2,6 +2,8 @@
 
 Interactive script to download GGUF AI models via Docker and import them into Ollama.
 
+![alt text](<GGUF Model Downloader-medium.gif>)
+
 ## Prerequisites
 
 - **Docker Desktop** must be installed and running
