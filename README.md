@@ -29,22 +29,29 @@ Based on the official documentation: [Import GGUF in Ollama](https://commbank.at
 
 ## Installation
 
-1. Clone or download this repository:
+Run the script directly with a single command:
+
 ```bash
-git clone <repository-url>
-cd GGUF_Model_Downloader
+bash <(curl -s https://raw.githubusercontent.com/Enelass/GGUF_Model_Downloader/refs/heads/main/download_docker_model.sh)
 ```
 
-2. Make the script executable:
+**Alternative**: Download and run locally:
 ```bash
+curl -O https://raw.githubusercontent.com/Enelass/GGUF_Model_Downloader/refs/heads/main/download_docker_model.sh
 chmod +x download_docker_model.sh
+./download_docker_model.sh
 ```
 
 ## Usage
 
-Run the script:
+If you downloaded the script locally:
 ```bash
 ./download_docker_model.sh
+```
+
+Or run directly from the URL (one-liner):
+```bash
+bash <(curl -s https://raw.githubusercontent.com/Enelass/GGUF_Model_Downloader/refs/heads/main/download_docker_model.sh)
 ```
 
 ### Navigation
