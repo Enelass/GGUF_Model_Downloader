@@ -1,5 +1,7 @@
 # GGUF Model Downloader
 
+**macOS 14+ · MIT · v0.5.0**
+
 Interactive script to download GGUF AI models via Docker and import them into Ollama.
 
 ![GGUF Model Downloader demo](GGUF%20Model%20Downloader-medium.gif)
