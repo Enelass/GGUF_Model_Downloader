@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-03-10
+
+### Changed
+- README now uses images from `assets/` (banner, logo, demo GIF).
+
+## [0.5.1] - 2026-03-10
+
 ### Added
 - MIT license file.
 
