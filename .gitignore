@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+.AppleDouble
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors / IDEs
+.vscode/
+.idea/
+
+# Agent notes (local-only)
+AGENTS.md
+
+# Shell / temp files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+nohup.out
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# Caches / temp dirs
+.cache/
+.tmp/
+tmp/
+
+# Node / Python (optional tooling)
+node_modules/
+__pycache__/
+*.pyc
