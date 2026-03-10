@@ -19,7 +19,9 @@ if ! command -v docker &> /dev/null; then
     print_message "$RED" "❌ Error: Docker command not found!"
     print_message "$YELLOW" "Please install Docker Desktop first: https://www.docker.com/products/docker-desktop"
     exit 1
-#print_message "$GREEN" "✅ Docker command found!"
+fi
+
+print_message "$GREEN" "✅ Docker command found!"
 
 # Check if jq command exists
 if ! command -v jq &> /dev/null; then
@@ -28,6 +30,7 @@ if ! command -v jq &> /dev/null; then
     print_message "$YELLOW" "  • macOS (Homebrew): brew install jq"
     print_message "$YELLOW" "  • Ubuntu/Debian:    sudo apt-get update && sudo apt-get install -y jq"
     exit 1
+fi
 
 print_message "$GREEN" "✅ jq command found!"
 
@@ -38,12 +41,6 @@ if ! command -v gguf_dump &> /dev/null; then
     exit 1
 fi
 
-fi
-
-#print_message "$GREEN" "✅ jq command found!"
-#echo
-
-# Display introduction
 print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
 print_message "$GREEN" "║            GGUF Model Downloader via Docker                    ║"
 print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
