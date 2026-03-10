@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-
+clear
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -21,7 +21,7 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-print_message "$GREEN" "✅ Docker command found!"
+#print_message "$GREEN" "✅ Docker command found!"
 
 # Check if jq command exists
 if ! command -v jq &> /dev/null; then
@@ -32,8 +32,8 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
-print_message "$GREEN" "✅ jq command found!"
-echo
+#print_message "$GREEN" "✅ jq command found!"
+#echo
 
 # Display introduction
 print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
@@ -50,6 +50,9 @@ print_message "$YELLOW" "ℹ️  Note: GGUF models are downloaded to ~/.docker/m
 echo "   You can then use these GGUF files with Ollama or other LLM runtimes."
 echo
 print_message "$GREEN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo
+print_message "$YELLOW" "Press Enter to continue..."
+read -r
 echo
 
 fetch_models_from_dockerhub() {
@@ -146,15 +149,15 @@ display_page() {
 
     # Display header
     printf "\n"
-    printf "%-4s %-35s %6s %10s   %s\n" "#" "Model Name" "Stars" "Pulls" "Description"
-    printf "%-4s %-35s %6s %10s   %s\n" "----" "-----------------------------------" "------" "----------" "-------------------------------------------------"
+    printf "%-4s %-31s %6s %10s   %s\n" "#" "Model Name" "Stars" "Pulls" "Description"
+    printf "%-4s %-31s %6s %10s   %s\n" "----" "-------------------------------" "------" "----------" "---------------------------------------------"
 
     # Display models
     for (( i=start_idx; i<end_idx; i++ )); do
         local display_num=$((i + 1))
         # Format pulls with comma separators for readability
         local formatted_pulls=$(printf "%'d" "${model_pulls[$i]}" 2>/dev/null || echo "${model_pulls[$i]}")
-        printf "%-4s %-35s %6s %10s   %s\n" \
+        printf "%-4s %-31s %6s %10s   %s\n" \
             "$display_num)" \
             "${model_names[$i]}" \
             "${model_stars[$i]}" \
@@ -361,11 +364,70 @@ if eval "$docker_command"; then
             echo
         else
             echo
-            print_message "$YELLOW" "⚠️  No GGUF files found in recent downloads."
-            echo "   Models are stored in: $blobs_dir"
-            echo "   You may need to manually identify the GGUF files using:"
-            echo "   find $blobs_dir -type f -exec sh -c 'head -c 4 \"\$1\" | xxd | grep -q \"4747 5546\" && echo \"\$1\"' _ {} \\;"
-            echo
+        print_message "$YELLOW" "⚠️  No GGUF files found in recent downloads. Scanning all blobs in $blobs_dir..."
+
+            declare -a gguf_files_all=()
+            while IFS= read -r file; do
+                if [ -f "$file" ]; then
+                    magic=$(head -c 4 "$file" 2>/dev/null | xxd -p 2>/dev/null)
+                    if [ "$magic" = "47475546" ]; then
+                        gguf_files_all+=("$file")
+                    fi
+                fi
+            done < <(find "$blobs_dir" -type f 2>/dev/null)
+
+            if [ ${#gguf_files_all[@]} -gt 0 ]; then
+                echo
+                print_message "$GREEN" "📁 GGUF file(s) found: ${#gguf_files_all[@]} file(s)"
+
+                IFS=$'
+' sorted_gguf_files_all=($(
+                    for f in "${gguf_files_all[@]}"; do
+                        echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                    done | sort -rn | cut -d'|' -f2
+                ))
+
+                for gguf_file in "${sorted_gguf_files_all[@]}"; do
+                    file_size=$(du -h "$gguf_file" | cut -f1)
+                    echo "   • $gguf_file ($file_size)"
+                done
+
+                echo
+                print_message "$GREEN" "📝 Next steps:"
+
+                if [ ${#gguf_files_all[@]} -eq 1 ]; then
+                    echo "   1. Create a Modelfile with:"
+                    echo "      FROM ${sorted_gguf_files_all[0]}"
+                    echo
+                else
+                    echo "   1. Create a Modelfile with (for multimodal/vision models):"
+                    echo "      FROM ${sorted_gguf_files_all[0]}"
+                    echo "      ADAPTER ${sorted_gguf_files_all[1]}"
+                    if [ ${#gguf_files_all[@]} -gt 2 ]; then
+                        for (( i=2; i<${#sorted_gguf_files_all[@]}; i++ )); do
+                            echo "      ADAPTER ${sorted_gguf_files_all[$i]}"
+                        done
+                    fi
+                    echo
+                    print_message "$YELLOW" "      Note: Largest file is usually the main model (FROM)"
+                    echo "            Smaller file(s) are typically vision/multimodal adapters (ADAPTER)"
+                    echo
+                fi
+
+                echo "   2. Import to Ollama: ollama create $selected_model -f Modelfile"
+                echo "   3. Run it: ollama run $selected_model"
+                echo
+                print_message "$YELLOW" "   ℹ️  Note: Ollama will copy the GGUF files to its own storage (~/.ollama/models)"
+                echo "      After successful import, you can safely delete the Docker blobs to save space."
+                echo
+            else
+                echo
+                print_message "$YELLOW" "⚠️  No GGUF files found in $blobs_dir."
+                echo "   Models are stored in: $blobs_dir"
+                echo "   You may need to ensure the model download completed and try again."
+                echo
+            fi
+
         fi
     else
         echo
