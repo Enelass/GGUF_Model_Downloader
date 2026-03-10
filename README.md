@@ -4,7 +4,7 @@
 
 # GGUF Model Downloader
 
-Automatically locate GGUF blobs inside Docker `ai/*` images and print ready-to-run Ollama import commands for fast local model import.
+Automatically locate GGUF blobs inside Docker `ai/*` images and print ready-to-run import/run commands for Ollama or llama.cpp for fast local model use.
 
 
 ![Bash](https://img.shields.io/badge/bash-3.2%2B-4EAA25?logo=gnu-bash&logoColor=white)
