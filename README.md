@@ -1,5 +1,3 @@
-![GGUF Model Downloader banner](assets/banner.png)
-
 <p align="center">
   <img src="assets/logo.png" alt="GGUF Model Downloader logo" width="160" />
 </p>
@@ -51,3 +49,5 @@ bash <(curl -s https://raw.githubusercontent.com/Enelass/GGUF_Model_Downloader/r
 - **q**: Quit
 
 That's it. Run the script, pick a model, and follow the on-screen instructions.
+
+![GGUF Model Downloader banner](assets/banner.png)
