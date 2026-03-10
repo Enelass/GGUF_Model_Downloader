@@ -320,12 +320,39 @@ if eval "$docker_command"; then
             echo
             print_message "$GREEN" "📁 GGUF file(s) found: ${#gguf_files[@]} file(s)"
 
-            # Sort files by size (largest first - usually the main model)
-            IFS=$'\n' sorted_gguf_files=($(
+            # Try to match using gguf_dump metadata if available
+            if command -v gguf_dump >/dev/null 2>&1; then
+                print_message "$YELLOW" "🔍 Using gguf_dump to match model metadata for '$selected_model'..."
+                declare -a matches=()
+                lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
                 for f in "${gguf_files[@]}"; do
-                    echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                done | sort -rn | cut -d'|' -f2
-            ))
+                    meta=$(gguf_dump "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+                    if [ -n "$meta" ] && echo "$meta" | grep -F -q "$lower_selected"; then
+                        matches+=("$f")
+                    fi
+                done
+                if [ ${#matches[@]} -gt 0 ]; then
+                    IFS=$'\n' sorted_gguf_files=($(
+                        for f in "${matches[@]}"; do
+                            echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                        done | sort -rn | cut -d'|' -f2
+                    ))
+                else
+                    # fallback to size sorting of all candidates
+                    IFS=$'\n' sorted_gguf_files=($(
+                        for f in "${gguf_files[@]}"; do
+                            echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                        done | sort -rn | cut -d'|' -f2
+                    ))
+                fi
+            else
+                print_message "$YELLOW" "gguf_dump not found; using size heuristic"
+                IFS=$'\n' sorted_gguf_files=($(
+                    for f in "${gguf_files[@]}"; do
+                        echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                    done | sort -rn | cut -d'|' -f2
+                ))
+            fi
 
             for gguf_file in "${sorted_gguf_files[@]}"; do
                 file_size=$(du -h "$gguf_file" | cut -f1)
@@ -380,12 +407,41 @@ if eval "$docker_command"; then
                 echo
                 print_message "$GREEN" "📁 GGUF file(s) found: ${#gguf_files_all[@]} file(s)"
 
-                IFS=$'
-' sorted_gguf_files_all=($(
+                # Try to match using gguf_dump metadata if available (full scan)
+                if command -v gguf_dump >/dev/null 2>&1; then
+                    print_message "$YELLOW" "🔍 Using gguf_dump to match model metadata for '$selected_model' (full scan)..."
+                    declare -a matches_all=()
+                    lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
                     for f in "${gguf_files_all[@]}"; do
-                        echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                    done | sort -rn | cut -d'|' -f2
-                ))
+                        meta=$(gguf_dump "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+                        if [ -n "$meta" ] && echo "$meta" | grep -F -q "$lower_selected"; then
+                            matches_all+=("$f")
+                        fi
+                    done
+                    if [ ${#matches_all[@]} -gt 0 ]; then
+                        IFS=$'
+' sorted_gguf_files_all=($(
+                            for f in "${matches_all[@]}"; do
+                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                            done | sort -rn | cut -d'|' -f2
+                        ))
+                    else
+                        IFS=$'
+' sorted_gguf_files_all=($(
+                            for f in "${gguf_files_all[@]}"; do
+                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                            done | sort -rn | cut -d'|' -f2
+                        ))
+                    fi
+                else
+                    print_message "$YELLOW" "gguf_dump not found; using size heuristic (full scan)"
+                    IFS=$'
+' sorted_gguf_files_all=($(
+                        for f in "${gguf_files_all[@]}"; do
+                            echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                        done | sort -rn | cut -d'|' -f2
+                    ))
+                fi
 
                 for gguf_file in "${sorted_gguf_files_all[@]}"; do
                     file_size=$(du -h "$gguf_file" | cut -f1)

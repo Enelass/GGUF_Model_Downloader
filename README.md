@@ -4,12 +4,11 @@
 
 # GGUF Model Downloader
 
-Automatically locate GGUF blobs inside Docker `ai/*` images and print ready-to-run import/run commands for Ollama or llama.cpp for fast local model use.
+A trusted list of reputable GGUF models sourced from Docker `ai/*` repositories. Enables GGUF downloads where corporate network restrictions may block Ollama, Hugging Face, or ModelScope. Automatically identify the correct GGUF blob and print ready-to-run import/run commands for Ollama or llama.cpp.
 
 
 ![Bash](https://img.shields.io/badge/bash-3.2%2B-4EAA25?logo=gnu-bash&logoColor=white)
-![Docker](https://img.shields.io/badge/docker-required-2496ED?logo=docker&logoColor=white)
-![jq](https://img.shields.io/badge/jq-required-000000?logo=jq&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-10.14%2B-000000?logo=apple&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/Enelass/GGUF_Model_Downloader?display_name=tag)](https://github.com/Enelass/GGUF_Model_Downloader/releases)
 
