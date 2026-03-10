@@ -19,8 +19,9 @@ Interactive script to download GGUF AI models via Docker and import them into Ol
 ## Prerequisites
 
 - **Bash** (macOS ships Bash 3.2)
-- **Docker Desktop** must be installed and running
+- **Docker Desktop** (required) must be installed and running
 - **jq** (used to parse the Docker Hub API)
+- **gguf_dump** (from llama.cpp) must be installed and on PATH; used to identify GGUF metadata
 - **Ollama** (optional) to run the downloaded models
 
 ## Installation & Usage

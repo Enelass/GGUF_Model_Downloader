@@ -19,8 +19,6 @@ if ! command -v docker &> /dev/null; then
     print_message "$RED" "❌ Error: Docker command not found!"
     print_message "$YELLOW" "Please install Docker Desktop first: https://www.docker.com/products/docker-desktop"
     exit 1
-fi
-
 #print_message "$GREEN" "✅ Docker command found!"
 
 # Check if jq command exists
@@ -30,6 +28,16 @@ if ! command -v jq &> /dev/null; then
     print_message "$YELLOW" "  • macOS (Homebrew): brew install jq"
     print_message "$YELLOW" "  • Ubuntu/Debian:    sudo apt-get update && sudo apt-get install -y jq"
     exit 1
+
+print_message "$GREEN" "✅ jq command found!"
+
+# Check if gguf_dump (llama.cpp) exists
+if ! command -v gguf_dump &> /dev/null; then
+    print_message "$RED" "❌ Error: gguf_dump not found!"
+    print_message "$YELLOW" "Install llama.cpp and ensure `gguf_dump` is on your PATH: https://github.com/ggerganov/llama.cpp"
+    exit 1
+fi
+
 fi
 
 #print_message "$GREEN" "✅ jq command found!"
@@ -346,14 +354,9 @@ if eval "$docker_command"; then
                     ))
                 fi
             else
-                print_message "$YELLOW" "gguf_dump not found; to enable metadata matching install llama.cpp (gguf_dump). See: https://github.com/ggerganov/llama.cpp"
-                print_message "$YELLOW" "Press Enter to continue using size heuristic or Ctrl+C to abort and install gguf_dump..."
-                read -r
-                IFS=$'\n' sorted_gguf_files=($(
-                    for f in "${gguf_files[@]}"; do
-                        echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                    done | sort -rn | cut -d'|' -f2
-                ))
+                print_message "$RED" "❌ Error: gguf_dump not found!"
+                print_message "$YELLOW" "Install llama.cpp and ensure `gguf_dump` is on your PATH: https://github.com/ggerganov/llama.cpp"
+                exit 1
             fi
 
             for gguf_file in "${sorted_gguf_files[@]}"; do
@@ -436,30 +439,9 @@ if eval "$docker_command"; then
                         ))
                     fi
                 else
-                    print_message "$YELLOW" "gguf_dump not found; attempting a quick strings-based metadata search (install gguf_dump for more reliable metadata matching: https://github.com/ggerganov/llama.cpp)"
-                    declare -a matches_all=()
-                    lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
-                    for f in "${gguf_files_all[@]}"; do
-                        if strings "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -F -q "$lower_selected"; then
-                            matches_all+=("$f")
-                        fi
-                    done
-                    if [ ${#matches_all[@]} -gt 0 ]; then
-                        IFS=$'
-' sorted_gguf_files_all=($(
-                            for f in "${matches_all[@]}"; do
-                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                            done | sort -rn | cut -d'|' -f2
-                        ))
-                    else
-                        print_message "$YELLOW" "No metadata match via strings; falling back to size heuristic (full scan)"
-                        IFS=$'
-' sorted_gguf_files_all=($(
-                            for f in "${gguf_files_all[@]}"; do
-                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                            done | sort -rn | cut -d'|' -f2
-                        ))
-                    fi
+                    print_message "$RED" "❌ Error: gguf_dump not found!"
+                    print_message "$YELLOW" "Install llama.cpp and ensure `gguf_dump` is on your PATH: https://github.com/ggerganov/llama.cpp"
+                    exit 1
                 fi
 
                 for gguf_file in "${sorted_gguf_files_all[@]}"; do
