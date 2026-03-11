@@ -451,6 +451,7 @@ if eval "$docker_command"; then
                         if printf "%s" "$meta" | grep -F -q "$SELECTED_NORM"; then
                             matches_all+=("$f")
                         fi
+                        fi
                     done
                     if [ ${#matches_all[@]} -gt 0 ]; then
                         IFS=$'
