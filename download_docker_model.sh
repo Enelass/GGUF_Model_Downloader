@@ -327,8 +327,11 @@ if eval "$docker_command"; then
                 lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
                 for f in "${gguf_files[@]}"; do
                     meta=$(gguf_dump "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
-                    if [ -n "$meta" ] && echo "$meta" | grep -F -q "$lower_selected"; then
+                    if [ -n "${meta}" ]; then
+                        SELECTED_NORM=$(printf "%s" "$lower_selected" | tr -d "[:space:]" | tr -cd "[:alnum:]")
+                        if printf "%s" "$meta" | grep -F -q "$SELECTED_NORM"; then
                         matches+=("$f")
+                        fi
                     fi
                 done
                 if [ ${#matches[@]} -gt 0 ]; then
@@ -414,7 +417,9 @@ if eval "$docker_command"; then
                     lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
                     for f in "${gguf_files_all[@]}"; do
                         meta=$(gguf_dump "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
-                        if [ -n "$meta" ] && echo "$meta" | grep -F -q "$lower_selected"; then
+                        if [ -n "${meta}" ]; then
+                        SELECTED_NORM=$(printf "%s" "$lower_selected" | tr -d "[:space:]" | tr -cd "[:alnum:]")
+                        if printf "%s" "$meta" | grep -F -q "$SELECTED_NORM"; then
                             matches_all+=("$f")
                         fi
                     done
@@ -438,8 +443,11 @@ if eval "$docker_command"; then
                     declare -a matches_all=()
                     lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
                     for f in "${gguf_files_all[@]}"; do
-                        meta=$(strings "$f" 2>/dev/null | awk 'BEGIN{f=0} /general.name/{f=1; next} f && NF{print; exit}' | tr '[:upper:]' '[:lower:]' || true)
-                        if [ -n "$meta" ] && echo "$meta" | grep -F -q "$lower_selected"; then
+                        meta=$(strings "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | tr -cd '[:alnum:]' 2>/dev/null || true)
+                    # meta now normalized (alphanumeric, lowercased)
+                        if [ -n "${meta}" ]; then
+                        SELECTED_NORM=$(printf "%s" "$lower_selected" | tr -d "[:space:]" | tr -cd "[:alnum:]")
+                        if printf "%s" "$meta" | grep -F -q "$SELECTED_NORM"; then
                             matches_all+=("$f")
                         fi
                     done
