@@ -21,7 +21,7 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-print_message "$GREEN" "✅ Docker command found!"
+#print_message "$GREEN" "✅ Docker command found!"
 
 # Check if jq command exists
 if ! command -v jq &> /dev/null; then
@@ -32,15 +32,10 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
-print_message "$GREEN" "✅ jq command found!"
+#print_message "$GREEN" "✅ jq command found!"
+#echo
 
-# Check if gguf_dump (llama.cpp) exists
-if ! command -v gguf_dump &> /dev/null; then
-    print_message "$RED" "❌ Error: gguf_dump not found!"
-    print_message "$YELLOW" "Install llama.cpp and ensure `gguf_dump` is on your PATH: https://github.com/ggerganov/llama.cpp"
-    exit 1
-fi
-
+# Display introduction
 print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
 print_message "$GREEN" "║            GGUF Model Downloader via Docker                    ║"
 print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
@@ -326,7 +321,7 @@ if eval "$docker_command"; then
             print_message "$GREEN" "📁 GGUF file(s) found: ${#gguf_files[@]} file(s)"
 
             # Try to match using gguf_dump metadata if available
-            if command -v gguf_dump >/dev/null 2>&1; then
+            if [ "$GGUF_TOOL" = "gguf_dump" ]; then
                 print_message "$YELLOW" "🔍 Using gguf_dump to match model metadata for '$selected_model'..."
                 declare -a matches=()
                 lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
@@ -351,9 +346,12 @@ if eval "$docker_command"; then
                     ))
                 fi
             else
-                print_message "$RED" "❌ Error: gguf_dump not found!"
-                print_message "$YELLOW" "Install llama.cpp and ensure `gguf_dump` is on your PATH: https://github.com/ggerganov/llama.cpp"
-                exit 1
+                print_message "$YELLOW" "gguf_dump not found; using size heuristic"
+                IFS=$'\n' sorted_gguf_files=($(
+                    for f in "${gguf_files[@]}"; do
+                        echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                    done | sort -rn | cut -d'|' -f2
+                ))
             fi
 
             for gguf_file in "${sorted_gguf_files[@]}"; do
@@ -410,7 +408,7 @@ if eval "$docker_command"; then
                 print_message "$GREEN" "📁 GGUF file(s) found: ${#gguf_files_all[@]} file(s)"
 
                 # Try to match using gguf_dump metadata if available (full scan)
-                if command -v gguf_dump >/dev/null 2>&1; then
+                if [ "$GGUF_TOOL" = "gguf_dump" ]; then
                     print_message "$YELLOW" "🔍 Using gguf_dump to match model metadata for '$selected_model' (full scan)..."
                     declare -a matches_all=()
                     lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
@@ -436,9 +434,30 @@ if eval "$docker_command"; then
                         ))
                     fi
                 else
-                    print_message "$RED" "❌ Error: gguf_dump not found!"
-                    print_message "$YELLOW" "Install llama.cpp and ensure `gguf_dump` is on your PATH: https://github.com/ggerganov/llama.cpp"
-                    exit 1
+                    print_message "$YELLOW" "🔍 Using strings to extract general.name (llama-gguf present, full scan)..."
+                    declare -a matches_all=()
+                    lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
+                    for f in "${gguf_files_all[@]}"; do
+                        meta=$(strings "$f" 2>/dev/null | awk 'BEGIN{f=0} /general.name/{f=1; next} f && NF{print; exit}' | tr '[:upper:]' '[:lower:]' || true)
+                        if [ -n "$meta" ] && echo "$meta" | grep -F -q "$lower_selected"; then
+                            matches_all+=("$f")
+                        fi
+                    done
+                    if [ ${#matches_all[@]} -gt 0 ]; then
+                        IFS=$'
+' sorted_gguf_files_all=($(
+                            for f in "${matches_all[@]}"; do
+                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                            done | sort -rn | cut -d'|' -f2
+                        ))
+                    else
+                        IFS=$'
+' sorted_gguf_files_all=($(
+                            for f in "${gguf_files_all[@]}"; do
+                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                            done | sort -rn | cut -d'|' -f2
+                        ))
+                    fi
                 fi
 
                 for gguf_file in "${sorted_gguf_files_all[@]}"; do
