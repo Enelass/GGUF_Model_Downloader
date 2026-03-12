@@ -7,6 +7,11 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Scanning performance tuning (bytes)
+HEADER_BYTES=${HEADER_BYTES:-4194304}  # 4 MiB
+MIN_SIZE_BYTES=${MIN_SIZE_BYTES:-1024}  # ignore tiny files
+
+
 # Function to print colored messages
 print_message() {
     local color=$1
@@ -444,7 +449,8 @@ if eval "$docker_command"; then
                     declare -a matches_all=()
                     lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
                     for f in "${gguf_files_all[@]}"; do
-                        meta=$(strings "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | tr -cd '[:alnum:]' 2>/dev/null || true)
+                        meta=$(head -c "$HEADER_BYTES" "$f" 2>/dev/null | strings | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | tr -cd '[:alnum:]' 2>/dev/null || true)
+                    # meta now normalized (alphanumeric, lowercased, header-only)
                     # meta now normalized (alphanumeric, lowercased)
                         if [ -n "${meta}" ]; then
                         SELECTED_NORM=$(printf "%s" "$lower_selected" | tr -d "[:space:]" | tr -cd "[:alnum:]")
