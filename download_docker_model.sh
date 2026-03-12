@@ -12,6 +12,19 @@ HEADER_BYTES=${HEADER_BYTES:-4194304}  # 4 MiB
 MIN_SIZE_BYTES=${MIN_SIZE_BYTES:-1024}  # ignore tiny files
 
 
+# Extract a GGUF KV value from header (header-limited, safe locale)
+extract_kv_header() {
+    local file="$1"
+    local key="$2"
+    LC_ALL=C head -c "$HEADER_BYTES" "$file" 2>/dev/null | LC_ALL=C strings | LC_ALL=C tr '[:upper:]' '[:lower:]' | awk -v k="$key" 'BEGIN{f=0} index(tolower($0), k){f=1; next} f && NF{print; exit}'
+}
+
+# Normalize token to letters-only (lowercase)
+normalize_letters() {
+    printf "%s" "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z]//g'
+}
+
+
 # Function to print colored messages
 print_message() {
     local color=$1
@@ -368,33 +381,60 @@ if eval "$docker_command"; then
             done
 
             echo
-            print_message "$GREEN" "📝 Next steps:"
+            print_message "$GREEN" "📝 Next steps:
+"
 
-            if [ ${#gguf_files[@]} -eq 1 ]; then
+            # Decide FROM/ADAPTER files based on detected GGUF metadata
+            if [ ${#sorted_gguf_files[@]} -eq 1 ]; then
                 # Single GGUF file
                 echo "   1. Create a Modelfile with:"
                 echo "      FROM ${sorted_gguf_files[0]}"
                 echo
             else
-                # Multiple GGUF files (likely text + vision)
-                echo "   1. Create a Modelfile with (for multimodal/vision models):"
+                # Detect adapters by checking general.file_type (header-only)
+                declare -a is_adapter=()
+                for idx in "${!sorted_gguf_files[@]}"; do
+                    fpath="${sorted_gguf_files[$idx]}"
+                    file_type=$(extract_kv_header "$fpath" "general.file_type")
+                    # also check tags/basename for adapter hints
+                    if [ -z "$file_type" ]; then
+                        file_type=$(extract_kv_header "$fpath" "general.tags")
+                    fi
+                    if [ -z "$file_type" ]; then
+                        file_type=$(extract_kv_header "$fpath" "general.basename")
+                    fi
+                    if [ -n "$file_type" ] && echo "$file_type" | LC_ALL=C grep -qi "adapter"; then
+                        is_adapter[$idx]=1
+                    else
+                        is_adapter[$idx]=0
+                    fi
+                done
+
+                # Print FROM for the largest (first) file
+                echo "   1. Create a Modelfile with:"
                 echo "      FROM ${sorted_gguf_files[0]}"
-                echo "      ADAPTER ${sorted_gguf_files[1]}"
-                if [ ${#gguf_files[@]} -gt 2 ]; then
-                    for (( i=2; i<${#sorted_gguf_files[@]}; i++ )); do
+
+                # Print ADAPTER lines only for files that are detected as adapters
+                adapter_count=0
+                for (( i=1; i<${#sorted_gguf_files[@]}; i++ )); do
+                    if [ "${is_adapter[$i]}" -eq 1 ]; then
                         echo "      ADAPTER ${sorted_gguf_files[$i]}"
-                    done
+                        adapter_count=$((adapter_count+1))
+                    fi
+                done
+
+                if [ "$adapter_count" -eq 0 ]; then
+                    echo
+                    echo "   Note: No adapter GGUF files detected."
                 fi
-                echo
-                print_message "$YELLOW" "      Note: Largest file is usually the main model (FROM)"
-                echo "            Smaller file(s) are typically vision/multimodal adapters (ADAPTER)"
                 echo
             fi
 
             echo "   2. Import to Ollama: ollama create $selected_model -f Modelfile"
             echo "   3. Run it: ollama run $selected_model"
-            echo
+
             print_message "$YELLOW" "   ℹ️  Note: Ollama will copy the GGUF files to its own storage (~/.ollama/models)"
+
             echo "      After successful import, you can safely delete the Docker blobs to save space."
             echo
         else
@@ -489,23 +529,44 @@ if eval "$docker_command"; then
                     echo "      FROM ${sorted_gguf_files_all[0]}"
                     echo
                 else
-                    echo "   1. Create a Modelfile with (for multimodal/vision models):"
+                    declare -a is_adapter_all=()
+                    for idx in "${!sorted_gguf_files_all[@]}"; do
+                        fpath="${sorted_gguf_files_all[$idx]}"
+                        file_type=$(extract_kv_header "$fpath" "general.file_type")
+                        if [ -z "$file_type" ]; then
+                            file_type=$(extract_kv_header "$fpath" "general.tags")
+                        fi
+                        if [ -z "$file_type" ]; then
+                            file_type=$(extract_kv_header "$fpath" "general.basename")
+                        fi
+                        if [ -n "$file_type" ] && echo "$file_type" | LC_ALL=C grep -qi "adapter"; then
+                            is_adapter_all[$idx]=1
+                        else
+                            is_adapter_all[$idx]=0
+                        fi
+                    done
+
+                    echo "   1. Create a Modelfile with:"
                     echo "      FROM ${sorted_gguf_files_all[0]}"
-                    echo "      ADAPTER ${sorted_gguf_files_all[1]}"
-                    if [ ${#gguf_files_all[@]} -gt 2 ]; then
-                        for (( i=2; i<${#sorted_gguf_files_all[@]}; i++ )); do
+
+                    adapter_count=0
+                    for (( i=1; i<${#sorted_gguf_files_all[@]}; i++ )); do
+                        if [ "${is_adapter_all[$i]}" -eq 1 ]; then
                             echo "      ADAPTER ${sorted_gguf_files_all[$i]}"
-                        done
+                            adapter_count=$((adapter_count+1))
+                        fi
+                    done
+
+                    if [ "$adapter_count" -eq 0 ]; then
+                        echo
+                        echo "   Note: No adapter GGUF files detected."
                     fi
-                    echo
-                    print_message "$YELLOW" "      Note: Largest file is usually the main model (FROM)"
-                    echo "            Smaller file(s) are typically vision/multimodal adapters (ADAPTER)"
                     echo
                 fi
 
                 echo "   2. Import to Ollama: ollama create $selected_model -f Modelfile"
                 echo "   3. Run it: ollama run $selected_model"
-                echo
+
                 print_message "$YELLOW" "   ℹ️  Note: Ollama will copy the GGUF files to its own storage (~/.ollama/models)"
                 echo "      After successful import, you can safely delete the Docker blobs to save space."
                 echo
