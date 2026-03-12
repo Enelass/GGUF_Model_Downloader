@@ -4,7 +4,12 @@
 
 # GGUF Model Downloader
 
-A trusted list of reputable GGUF models sourced from Docker `ai/*` repositories. Enables GGUF downloads where corporate network restrictions may block Ollama, Hugging Face, or ModelScope. Automatically identify the correct GGUF blob and print ready-to-run import/run commands for Ollama or llama.cpp.
+A trusted list of reputable GGUF models sourced from Docker `ai/*` repositories.
+
+Value proposition:
+  - Offer a curated, trusted list of GGUF models surfaced from Docker Hub.
+  - Provide GGUF downloads where corporate network restrictions may block Ollama, Hugging Face, or ModelScope.
+  - Automatically identify GGUF blobs to simplify importing into Ollama or llama.cpp (gguf_dump / llama-gguf metadata).
 
 
 ![Bash](https://img.shields.io/badge/bash-3.2%2B-4EAA25?logo=gnu-bash&logoColor=white)
@@ -21,7 +26,7 @@ Interactive script to download GGUF AI models via Docker and import them into Ol
 - **Bash** (macOS ships Bash 3.2)
 - **Docker Desktop** (required) must be installed and running
 - **jq** (used to parse the Docker Hub API)
-- **gguf_dump** (from llama.cpp) must be installed and on PATH; used to identify GGUF metadata
+- **gguf_dump** (from llama.cpp) or **llama-gguf** must be installed and on PATH; used to identify GGUF metadata
 - **Ollama** (optional) to run the downloaded models
 
 ## Installation & Usage
