@@ -83,7 +83,7 @@ echo "   You can then use these GGUF files with Ollama or other LLM runtimes."
 echo
 print_message "$GREEN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo
-print_message "$YELLOW" "Press Enter to continue..."
+print_message "$YELLOW" "Press enter to continue"
 read -r
 echo
 
@@ -181,15 +181,15 @@ display_page() {
 
     # Display header
     printf "\n"
-    printf "%-4s %-31s %6s %10s   %s\n" "#" "Model Name" "Stars" "Pulls" "Description"
-    printf "%-4s %-31s %6s %10s   %s\n" "----" "-------------------------------" "------" "----------" "---------------------------------------------"
+    printf "%-4s %-27s %6s %10s   %s\n" "#" "Model Name" "Stars" "Pulls" "Description"
+    printf "%-4s %-27s %6s %10s   %s\n" "----" "---------------------------" "------" "----------" "-----------------------------------------"
 
     # Display models
     for (( i=start_idx; i<end_idx; i++ )); do
         local display_num=$((i + 1))
         # Format pulls with comma separators for readability
         local formatted_pulls=$(printf "%'d" "${model_pulls[$i]}" 2>/dev/null || echo "${model_pulls[$i]}")
-        printf "%-4s %-31s %6s %10s   %s\n" \
+        printf "%-4s %-27s %6s %10s   %s\n" \
             "$display_num)" \
             "${model_names[$i]}" \
             "${model_stars[$i]}" \
