@@ -16,12 +16,12 @@ MIN_SIZE_BYTES=${MIN_SIZE_BYTES:-1024}  # ignore tiny files
 extract_kv_header() {
     local file="$1"
     local key="$2"
-    LC_ALL=C head -c "$HEADER_BYTES" "$file" 2>/dev/null | LC_ALL=C strings | LC_ALL=C tr '[:upper:]' '[:lower:]' | awk -v k="$key" 'BEGIN{f=0} index(tolower($0), k){f=1; next} f && NF{print; exit}'
+    LC_ALL=C head -c "$HEADER_BYTES" "$file" 2>/dev/null | LC_ALL=C strings | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C awk -v k="$key" 'BEGIN{f=0} index($0, k){f=1; next} f && NF{print; exit}'
 }
 
 # Normalize token to letters-only (lowercase)
 normalize_letters() {
-    printf "%s" "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z]//g'
+    printf "%s" "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z]//g'
 }
 
 
@@ -54,6 +54,20 @@ fi
 #echo
 
 # Display introduction
+# Detect available GGUF tooling: prefer gguf_dump, fallback to llama-gguf
+GGUF_TOOL=""
+if command -v gguf_dump >/dev/null 2>&1; then
+    GGUF_TOOL="gguf_dump"
+    print_message "$GREEN" "✅ gguf_dump found: using precise GGUF metadata parsing"
+elif command -v llama-gguf >/dev/null 2>&1; then
+    GGUF_TOOL="llama-gguf"
+    print_message "$YELLOW" "⚠️  gguf_dump not found; will use header-limited strings-based metadata scanning via llama-gguf (install gguf_dump for more reliable metadata matching: https://github.com/ggerganov/llama.cpp)"
+else
+    print_message "$RED" "❌ Error: gguf_dump or llama-gguf is required to identify GGUF metadata."
+    print_message "$YELLOW" "Install gguf_dump (preferred) or llama-gguf and re-run the script."
+    exit 1
+fi
+
 print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
 print_message "$GREEN" "║            GGUF Model Downloader via Docker                    ║"
 print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
@@ -344,7 +358,7 @@ if eval "$docker_command"; then
                 declare -a matches=()
                 lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
                 for f in "${gguf_files[@]}"; do
-                    meta=$(gguf_dump "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+                    meta=$(LC_ALL=C gguf_dump "$f" 2>/dev/null | LC_ALL=C tr '[:upper:]' '[:lower:]' || true)
                     if [ -n "${meta}" ]; then
                         SELECTED_NORM=$(printf "%s" "$lower_selected" | tr -d "[:space:]" | tr -cd "[:alnum:]")
                         if printf "%s" "$meta" | grep -F -q "$SELECTED_NORM"; then
@@ -461,7 +475,7 @@ if eval "$docker_command"; then
                     declare -a matches_all=()
                     lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
                     for f in "${gguf_files_all[@]}"; do
-                        meta=$(gguf_dump "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+                        meta=$(LC_ALL=C gguf_dump "$f" 2>/dev/null | LC_ALL=C tr '[:upper:]' '[:lower:]' || true)
                         if [ -n "${meta}" ]; then
                         SELECTED_NORM=$(printf "%s" "$lower_selected" | tr -d "[:space:]" | tr -cd "[:alnum:]")
                         if printf "%s" "$meta" | grep -F -q "$SELECTED_NORM"; then
@@ -489,7 +503,7 @@ if eval "$docker_command"; then
                     declare -a matches_all=()
                     lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
                     for f in "${gguf_files_all[@]}"; do
-                        meta=$(head -c "$HEADER_BYTES" "$f" 2>/dev/null | strings | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | tr -cd '[:alnum:]' 2>/dev/null || true)
+                        meta=$(LC_ALL=C head -c "$HEADER_BYTES" "$f" 2>/dev/null | LC_ALL=C strings | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -d '[:space:]' | LC_ALL=C tr -cd '[:alnum:]' 2>/dev/null || true)
                     # meta now normalized (alphanumeric, lowercased, header-only)
                     # meta now normalized (alphanumeric, lowercased)
                         if [ -n "${meta}" ]; then
