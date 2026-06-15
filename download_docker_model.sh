@@ -10,6 +10,14 @@ NC='\033[0m' # No Color
 # Scanning performance tuning (bytes)
 HEADER_BYTES=${HEADER_BYTES:-4194304}  # 4 MiB
 MIN_SIZE_BYTES=${MIN_SIZE_BYTES:-1024}  # ignore tiny files
+DOWNLOAD_RETRY_DELAY_SECONDS=${DOWNLOAD_RETRY_DELAY_SECONDS:-5}
+DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-10}
+PATH_DISPLAY_WIDTH=${PATH_DISPLAY_WIDTH:-80}
+
+IS_MACOS=0
+if [ "$(uname -s)" = "Darwin" ]; then
+    IS_MACOS=1
+fi
 
 
 # Extract a GGUF KV value from header (header-limited, safe locale)
@@ -19,9 +27,158 @@ extract_kv_header() {
     LC_ALL=C head -c "$HEADER_BYTES" "$file" 2>/dev/null | LC_ALL=C strings | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C awk -v k="$key" 'BEGIN{f=0} index($0, k){f=1; next} f && NF{print; exit}'
 }
 
+extract_kv_exact() {
+    local file="$1"
+    local key="$2"
+    LC_ALL=C head -c "$HEADER_BYTES" "$file" 2>/dev/null | LC_ALL=C strings | LC_ALL=C awk -v k="$key" '$0 == k { getline; print; exit }'
+}
+
+extract_arch_kv() {
+    local file="$1"
+    local arch="$2"
+    local suffix="$3"
+
+    if [ -z "$arch" ] || [ "$arch" = "-" ]; then
+        return
+    fi
+
+    extract_kv_exact "$file" "${arch}.${suffix}"
+}
+
+extract_gguf_metadata() {
+    local file="$1"
+
+    case "$GGUF_TOOL" in
+        gguf_dump)
+            LC_ALL=C gguf_dump "$file" 2>/dev/null || true
+            ;;
+        llama-gguf)
+            LC_ALL=C llama-gguf "$file" r n 2>/dev/null || true
+            ;;
+    esac
+
+    LC_ALL=C head -c "$HEADER_BYTES" "$file" 2>/dev/null | LC_ALL=C strings || true
+}
+
+extract_tensor_count() {
+    local file="$1"
+    local output=""
+
+    case "$GGUF_TOOL" in
+        gguf_dump)
+            output=$(LC_ALL=C gguf_dump "$file" 2>/dev/null || true)
+            ;;
+        llama-gguf)
+            output=$(LC_ALL=C llama-gguf "$file" r n 2>/dev/null || true)
+            ;;
+    esac
+
+    printf "%s" "$output" | LC_ALL=C awk '/n_tensors:/ { print $NF; exit }'
+}
+
+normalize_alnum_lower() {
+    printf "%s" "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -d "[:space:]" | LC_ALL=C tr -cd "[:alnum:]"
+}
+
+is_incompatible_model_for_platform() {
+    local name="$1"
+    local lower_name
+
+    if [ "$IS_MACOS" -eq 1 ]; then
+        lower_name=$(printf "%s" "$name" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+        case "$lower_name" in
+            *vllm*) return 0 ;;
+        esac
+    fi
+
+    return 1
+}
+
 # Normalize token to letters-only (lowercase)
 normalize_letters() {
     printf "%s" "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z]//g'
+}
+
+format_size_gb() {
+    local bytes="$1"
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        printf "-"
+        return
+    fi
+
+    awk -v bytes="$bytes" 'BEGIN {
+        gb = bytes / 1024 / 1024 / 1024
+        rounded = int(gb * 10 + 0.5) / 10
+        if (rounded == int(rounded)) {
+            printf "%d GB", rounded
+        } else {
+            printf "%.1f GB", rounded
+        }
+    }'
+}
+
+truncate_text() {
+    local value="$1"
+    local width="$2"
+
+    if [ "${#value}" -le "$width" ]; then
+        printf "%s" "$value"
+        return
+    fi
+
+    if [ "$width" -le 3 ]; then
+        printf "%.*s" "$width" "$value"
+        return
+    fi
+
+    printf "%.*s..." "$((width - 3))" "$value"
+}
+
+crop_middle() {
+    local value="$1"
+    local width="$2"
+    local value_len=${#value}
+    local prefix_len
+    local suffix_len
+
+    if [ "$value_len" -le "$width" ]; then
+        printf "%s" "$value"
+        return
+    fi
+
+    if [ "$width" -le 3 ]; then
+        printf "%.*s" "$width" "$value"
+        return
+    fi
+
+    prefix_len=$(( (width - 3) / 2 ))
+    suffix_len=$(( width - 3 - prefix_len ))
+    printf "%s...%s" "${value:0:$prefix_len}" "${value:$((value_len - suffix_len)):$suffix_len}"
+}
+
+pull_model_with_retries() {
+    local model_reference="$1"
+    local attempt=0
+
+    while true; do
+        if [ "$attempt" -eq 0 ]; then
+            print_message "$YELLOW" "Running: docker model pull $model_reference"
+        else
+            print_message "$YELLOW" "Retry $attempt/$DOWNLOAD_MAX_RETRIES: docker model pull $model_reference"
+        fi
+
+        if docker model pull "$model_reference"; then
+            return 0
+        fi
+
+        if [ "$attempt" -ge "$DOWNLOAD_MAX_RETRIES" ]; then
+            return 1
+        fi
+
+        attempt=$((attempt + 1))
+        print_message "$YELLOW" "Download failed. Retrying in ${DOWNLOAD_RETRY_DELAY_SECONDS}s..."
+        sleep "$DOWNLOAD_RETRY_DELAY_SECONDS"
+    done
 }
 
 
@@ -30,6 +187,47 @@ print_message() {
     local color=$1
     local message=$2
     echo -e "${color}${message}${NC}"
+}
+
+SPINNER_PID=""
+
+start_spinner() {
+    local message="$1"
+
+    stop_spinner
+
+    if [ ! -t 1 ]; then
+        print_message "$YELLOW" "$message"
+        return
+    fi
+
+    (
+        while true; do
+            for frame in "-" "\\" "|" "/"; do
+                printf "\r${YELLOW}%s${NC} %s" "$frame" "$message"
+                sleep 0.12
+            done
+        done
+    ) &
+    SPINNER_PID=$!
+}
+
+stop_spinner() {
+    if [ -n "${SPINNER_PID:-}" ]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+
+        if [ -t 1 ]; then
+            printf "\r\033[K"
+        fi
+    fi
+}
+
+print_banner() {
+    print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
+    print_message "$GREEN" "║                 Docker Model Downloader                        ║"
+    print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
 }
 
 # Check if docker command exists
@@ -54,38 +252,312 @@ fi
 #echo
 
 # Display introduction
-# Detect available GGUF tooling: prefer gguf_dump, fallback to llama-gguf
+# Detect available GGUF tooling: prefer gguf_dump when present; Homebrew llama.cpp provides llama-gguf.
 GGUF_TOOL=""
+GGUF_TOOL_MESSAGE=""
 if command -v gguf_dump >/dev/null 2>&1; then
     GGUF_TOOL="gguf_dump"
-    print_message "$GREEN" "✅ gguf_dump found: using precise GGUF metadata parsing"
+    GGUF_TOOL_MESSAGE="✅ GGUF metadata: gguf_dump"
 elif command -v llama-gguf >/dev/null 2>&1; then
     GGUF_TOOL="llama-gguf"
-    print_message "$YELLOW" "⚠️  gguf_dump not found; will use header-limited strings-based metadata scanning via llama-gguf (install gguf_dump for more reliable metadata matching: https://github.com/ggerganov/llama.cpp)"
+    GGUF_TOOL_MESSAGE="✅ GGUF metadata: llama-gguf"
 else
     print_message "$RED" "❌ Error: gguf_dump or llama-gguf is required to identify GGUF metadata."
-    print_message "$YELLOW" "Install gguf_dump (preferred) or llama-gguf and re-run the script."
+    print_message "$YELLOW" "Install llama.cpp (macOS: brew install llama.cpp) and re-run the script."
     exit 1
 fi
 
-print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
-print_message "$GREEN" "║            GGUF Model Downloader via Docker                    ║"
-print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
-echo
-print_message "$YELLOW" "📖 What this script does:"
-echo "   • Fetches the latest Docker Hub AI models each run"
-echo "   • Lets you select a model interactively"
-echo "   • Downloads the selected GGUF model using Docker"
-echo "   • Shows you where the downloaded GGUF files are located"
-echo
-print_message "$YELLOW" "ℹ️  Note: GGUF models are downloaded to ~/.docker/models/blobs/sha256/"
-echo "   You can then use these GGUF files with Ollama or other LLM runtimes."
-echo
-print_message "$GREEN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo
-print_message "$YELLOW" "Press enter to continue"
-read -r
-echo
+render_startup_menu() {
+    local selected="$1"
+    local remaining="$2"
+    local interacted="$3"
+
+    clear
+    print_banner
+    echo
+    echo "   Select a Docker AI model and variant, download it, then locate the GGUF blob."
+    echo "   Docker stores model blobs in: ~/.docker/models/blobs/sha256/"
+    echo
+    print_message "$GREEN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+    print_message "$GREEN" "$GGUF_TOOL_MESSAGE"
+    echo
+
+    if [ "$selected" -eq 1 ]; then
+        echo " > (*) Download models"
+        echo "   ( ) Check downloaded models"
+    else
+        echo "   ( ) Download models"
+        echo " > (*) Check downloaded models"
+    fi
+
+    echo
+    if [ "$interacted" -eq 1 ]; then
+        print_message "$YELLOW" "Use ↑/↓ then Enter. [q] Quit"
+    else
+        print_message "$YELLOW" "Use ↑/↓ then Enter. Auto-starting downloader in ${remaining}s. [q] Quit"
+    fi
+}
+
+select_startup_action() {
+    local selected=1
+    local deadline=$((SECONDS + 5))
+    local interacted=0
+    local remaining
+    local key
+    local rest
+
+    while true; do
+        if [ "$interacted" -eq 0 ]; then
+            remaining=$((deadline - SECONDS))
+            if [ "$remaining" -le 0 ]; then
+                APP_ACTION="download"
+                return
+            fi
+        else
+            remaining=0
+        fi
+
+        render_startup_menu "$selected" "$remaining" "$interacted"
+
+        if [ "$interacted" -eq 0 ]; then
+            if ! IFS= read -t "$remaining" -r -s -n 1 key 2>/dev/null; then
+                APP_ACTION="download"
+                return
+            fi
+        else
+            IFS= read -r -s -n 1 key 2>/dev/null
+        fi
+
+        case "$key" in
+            "")
+                if [ "$selected" -eq 1 ]; then
+                    APP_ACTION="download"
+                else
+                    APP_ACTION="check"
+                fi
+                return
+                ;;
+            $'\x1b')
+                if [ -t 0 ]; then
+                    IFS= read -t 0.5 -r -s -n 2 rest 2>/dev/null || true
+                else
+                    IFS= read -r -s -n 2 rest 2>/dev/null || true
+                fi
+                case "$rest" in
+                    '[A'|'[B')
+                        interacted=1
+                        if [ "$selected" -eq 1 ]; then
+                            selected=2
+                        else
+                            selected=1
+                        fi
+                        ;;
+                esac
+                ;;
+            '[')
+                IFS= read -r -s -n 1 rest 2>/dev/null || true
+                case "$rest" in
+                    A|B)
+                        interacted=1
+                        if [ "$selected" -eq 1 ]; then
+                            selected=2
+                        else
+                            selected=1
+                        fi
+                        ;;
+                esac
+                ;;
+            1)
+                APP_ACTION="download"
+                return
+                ;;
+            2)
+                APP_ACTION="check"
+                return
+                ;;
+            q|Q)
+                print_message "$YELLOW" "Exiting..."
+                exit 0
+                ;;
+        esac
+    done
+}
+
+APP_ACTION="download"
+select_startup_action
+
+display_downloaded_models() {
+    clear
+    print_banner
+    echo
+    print_message "$GREEN" "📁 Downloaded Docker GGUF models"
+    echo
+
+    local blobs_dir="$HOME/.docker/models/blobs/sha256"
+    if [ ! -d "$blobs_dir" ]; then
+        print_message "$YELLOW" "⚠️  Docker models directory not found: $blobs_dir"
+        return
+    fi
+
+    start_spinner "Scanning local Docker model blobs..."
+
+    declare -a downloaded_gguf_files=()
+    local incomplete_count=0
+    while IFS= read -r file; do
+        case "$file" in
+            *.incomplete)
+                incomplete_count=$((incomplete_count + 1))
+                continue
+                ;;
+        esac
+
+        if [ -f "$file" ]; then
+            magic=$(head -c 4 "$file" 2>/dev/null | xxd -p 2>/dev/null)
+            if [ "$magic" = "47475546" ]; then
+                downloaded_gguf_files+=("$file")
+            fi
+        fi
+    done < <(find "$blobs_dir" -type f 2>/dev/null)
+
+    stop_spinner
+
+    if [ ${#downloaded_gguf_files[@]} -eq 0 ]; then
+        print_message "$YELLOW" "No GGUF files found in $blobs_dir."
+        return
+    fi
+
+    IFS=$'\n' sorted_downloaded_gguf_files=($(
+        for f in "${downloaded_gguf_files[@]}"; do
+            echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+        done | sort -rn | cut -d'|' -f2
+    ))
+
+    start_spinner "Reading GGUF metadata..."
+
+    declare -a group_names=()
+    declare -a record_groups=()
+    declare -a record_roles=()
+    declare -a record_arches=()
+    declare -a record_sizes=()
+    declare -a record_contexts=()
+    declare -a record_quants=()
+    declare -a record_tensors=()
+    declare -a record_paths=()
+
+    for gguf_file in "${sorted_downloaded_gguf_files[@]}"; do
+        local file_size
+        local model_name
+        local arch
+        local role
+        local context_length
+        local file_type
+        local quant_version
+        local quantization
+        local tensor_count
+        local cropped_path
+        local group_exists=0
+        local group_name
+
+        file_size=$(du -h "$gguf_file" | awk '{print $1}')
+        model_name=$(extract_kv_exact "$gguf_file" "general.name")
+        if [ -z "$model_name" ]; then
+            model_name=$(extract_kv_exact "$gguf_file" "general.basename")
+        fi
+        if [ -z "$model_name" ]; then
+            model_name="Unknown GGUF model"
+        fi
+
+        arch=$(extract_kv_exact "$gguf_file" "general.architecture")
+        if [ -z "$arch" ]; then
+            arch="-"
+        fi
+
+        role=$(extract_kv_exact "$gguf_file" "general.type")
+        if [ "$arch" = "clip" ]; then
+            role="projector"
+        elif [ -z "$role" ]; then
+            role="model"
+        fi
+
+        context_length=$(extract_arch_kv "$gguf_file" "$arch" "context_length")
+        if ! [[ "$context_length" =~ ^[0-9]+$ ]]; then
+            context_length="-"
+        fi
+
+        file_type=$(extract_kv_exact "$gguf_file" "general.file_type")
+        quant_version=$(extract_kv_exact "$gguf_file" "general.quantization_version")
+        if ! [[ "$file_type" =~ ^[0-9]+$ ]]; then
+            file_type=""
+        fi
+        if ! [[ "$quant_version" =~ ^[0-9]+$ ]]; then
+            quant_version=""
+        fi
+        if [ -n "$file_type" ] && [ -n "$quant_version" ]; then
+            quantization="type ${file_type}/v${quant_version}"
+        elif [ -n "$file_type" ]; then
+            quantization="type ${file_type}"
+        elif [ -n "$quant_version" ]; then
+            quantization="v${quant_version}"
+        else
+            quantization="-"
+        fi
+
+        tensor_count=$(extract_tensor_count "$gguf_file")
+        if [ -z "$tensor_count" ]; then
+            tensor_count="-"
+        fi
+
+        cropped_path=$(crop_middle "$gguf_file" "$PATH_DISPLAY_WIDTH")
+
+        for group_name in "${group_names[@]}"; do
+            if [ "$group_name" = "$model_name" ]; then
+                group_exists=1
+                break
+            fi
+        done
+        if [ "$group_exists" -eq 0 ]; then
+            group_names+=("$model_name")
+        fi
+
+        record_groups+=("$model_name")
+        record_roles+=("$role")
+        record_arches+=("$arch")
+        record_sizes+=("$file_size")
+        record_contexts+=("$context_length")
+        record_quants+=("$quantization")
+        record_tensors+=("$tensor_count")
+        record_paths+=("$cropped_path")
+    done
+
+    stop_spinner
+
+    print_message "$GREEN" "Found ${#sorted_downloaded_gguf_files[@]} GGUF file(s) across ${#group_names[@]} model group(s):"
+    if [ "$incomplete_count" -gt 0 ]; then
+        print_message "$YELLOW" "Skipped $incomplete_count incomplete download file(s)."
+    fi
+    echo
+
+    for group_name in "${group_names[@]}"; do
+        print_message "$GREEN" "$group_name"
+        printf "  %-10s %-10s %-7s %-9s %-13s %-8s %s\n" "Role" "Arch" "Size" "Context" "Quant" "Tensors" "Path"
+
+        local idx
+        for idx in "${!record_groups[@]}"; do
+            if [ "${record_groups[$idx]}" = "$group_name" ]; then
+                printf "  %-10s %-10s %-7s %-9s %-13s %-8s %s\n" \
+                    "$(truncate_text "${record_roles[$idx]}" 10)" \
+                    "$(truncate_text "${record_arches[$idx]}" 10)" \
+                    "${record_sizes[$idx]}" \
+                    "$(truncate_text "${record_contexts[$idx]}" 9)" \
+                    "$(truncate_text "${record_quants[$idx]}" 13)" \
+                    "${record_tensors[$idx]}" \
+                    "${record_paths[$idx]}"
+            fi
+        done
+        echo
+    done
+}
 
 fetch_models_from_dockerhub() {
     model_names=()
@@ -96,8 +568,9 @@ fetch_models_from_dockerhub() {
     local page=1
     local page_size=100
     local max_attempts=3
+    local skipped_incompatible_models=0
 
-    print_message "$YELLOW" "🔄 Fetching latest model list from Docker Hub..."
+    start_spinner "Retrieving model list from Docker Hub..."
 
     while true; do
         local url="https://hub.docker.com/v2/repositories/ai?page_size=${page_size}&page=${page}&ordering=last_updated"
@@ -112,12 +585,14 @@ fetch_models_from_dockerhub() {
         done
 
         if [ -z "$response" ]; then
+            stop_spinner
             print_message "$RED" "❌ Failed to fetch model list from Docker Hub (page $page)."
             print_message "$YELLOW" "Check your internet connection and try again."
             exit 1
         fi
 
         if ! echo "$response" | jq -e '.results and (.results|type=="array")' >/dev/null 2>&1; then
+            stop_spinner
             print_message "$RED" "❌ Docker Hub returned an unexpected response (page $page)."
             print_message "$YELLOW" "Try again later (you may be rate-limited)."
             exit 1
@@ -130,6 +605,11 @@ fetch_models_from_dockerhub() {
         fi
 
         while IFS='|' read -r name stars pulls description; do
+            if is_incompatible_model_for_platform "$name"; then
+                skipped_incompatible_models=$((skipped_incompatible_models + 1))
+                continue
+            fi
+
             model_names+=("$name")
             model_stars+=("$stars")
             model_pulls+=("$pulls")
@@ -147,6 +627,12 @@ fetch_models_from_dockerhub() {
         page=$((page + 1))
     done
 
+    stop_spinner
+
+    if [ "$skipped_incompatible_models" -gt 0 ]; then
+        print_message "$YELLOW" "Filtered $skipped_incompatible_models vLLM model(s) on macOS."
+    fi
+
     if [ ${#model_names[@]} -eq 0 ]; then
         print_message "$RED" "❌ No models returned from Docker Hub."
         print_message "$YELLOW" "Try again later."
@@ -154,10 +640,196 @@ fetch_models_from_dockerhub() {
     fi
 }
 
+fetch_variants_for_model() {
+    local model="$1"
+    local repo="ai/$model"
+    local page=1
+    local page_size=100
+    local max_attempts=3
+
+    variant_tags=()
+    variant_params=()
+    variant_quantizations=()
+    variant_contexts=()
+    variant_vrams=()
+    variant_tool_callings=()
+    variant_sizes=()
+
+    start_spinner "Retrieving variants for ai/$model..."
+
+    local token=""
+    token=$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" | jq -r '.token // empty' 2>/dev/null || true)
+
+    while true; do
+        local url="https://hub.docker.com/v2/repositories/${repo}/tags?page_size=${page_size}&page=${page}"
+        local response=""
+        local attempt
+
+        for attempt in $(seq 1 "$max_attempts"); do
+            if response=$(curl -fsSL "$url" -H 'accept: */*' 2>/dev/null); then
+                break
+            fi
+            sleep 0.4
+        done
+
+        if [ -z "$response" ]; then
+            break
+        fi
+
+        if ! echo "$response" | jq -e '.results and (.results|type=="array")' >/dev/null 2>&1; then
+            break
+        fi
+
+        local page_count
+        page_count=$(echo "$response" | jq -r '.results | length')
+        if [ "$page_count" -eq 0 ]; then
+            break
+        fi
+
+        while IFS='|' read -r tag full_size; do
+            local params="-"
+            local quantization="-"
+            local context_window="-"
+            local vram="-"
+            local tool_calling="-"
+            local formatted_size
+            formatted_size=$(format_size_gb "$full_size")
+
+            if [ -n "$token" ]; then
+                local manifest=""
+                local config_digest=""
+                local config=""
+
+                manifest=$(curl -fsSL "https://registry-1.docker.io/v2/${repo}/manifests/${tag}" \
+                    -H "Authorization: Bearer ${token}" \
+                    -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.cncf.model.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+                    2>/dev/null || true)
+
+                if [ -n "$manifest" ]; then
+                    config_digest=$(printf "%s" "$manifest" | jq -r '.config.digest // empty' 2>/dev/null || true)
+                fi
+
+                if [ -n "$config_digest" ]; then
+                    config=$(curl -fsSL "https://registry-1.docker.io/v2/${repo}/blobs/${config_digest}" \
+                        -H "Authorization: Bearer ${token}" \
+                        2>/dev/null || true)
+                fi
+
+                if [ -n "$config" ]; then
+                    params=$(printf "%s" "$config" | jq -r '.config.paramSize // .config.parameters // "-"' 2>/dev/null || echo "-")
+                    quantization=$(printf "%s" "$config" | jq -r '.config.quantization // "-"' 2>/dev/null || echo "-")
+                    context_window=$(printf "%s" "$config" | jq -r '.config.contextWindow // .config.contextLength // .config.context // "-"' 2>/dev/null || echo "-")
+                    vram=$(printf "%s" "$config" | jq -r '.config.vram // .config.vramSize // "-"' 2>/dev/null || echo "-")
+                    tool_calling=$(printf "%s" "$config" | jq -r '.config.toolCalling // .config.tool_calls // "-"' 2>/dev/null || echo "-")
+                fi
+            fi
+
+            variant_tags+=("$tag")
+            variant_params+=("$params")
+            variant_quantizations+=("$quantization")
+            variant_contexts+=("$context_window")
+            variant_vrams+=("$vram")
+            variant_tool_callings+=("$tool_calling")
+            variant_sizes+=("$formatted_size")
+        done < <(
+            echo "$response" | jq -r '.results[] | "\(.name)|\(.full_size // 0)"'
+        )
+
+        local next_url
+        next_url=$(echo "$response" | jq -r '.next')
+        if [ "$next_url" = "null" ] || [ -z "$next_url" ]; then
+            break
+        fi
+
+        page=$((page + 1))
+    done
+
+    stop_spinner
+
+    if [ ${#variant_tags[@]} -eq 0 ]; then
+        variant_tags=("latest")
+        variant_params=("-")
+        variant_quantizations=("-")
+        variant_contexts=("-")
+        variant_vrams=("-")
+        variant_tool_callings=("-")
+        variant_sizes=("-")
+    fi
+}
+
+select_variant_for_model() {
+    local model="$1"
+
+    while true; do
+        clear
+        print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
+        print_message "$GREEN" "║                 Docker Model Downloader                        ║"
+        print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
+        echo
+        print_message "$GREEN" "📋 Available variants for ai/$model"
+        echo
+        printf "%-4s %-28s %-12s %-18s %-15s %-10s %-14s %-10s\n" "#" "Variant" "Parameters" "Quantization" "Context Window" "VRAM" "Tool Calling" "Size"
+        printf "%-4s %-28s %-12s %-18s %-15s %-10s %-14s %-10s\n" "----" "----------------------------" "------------" "------------------" "---------------" "----------" "--------------" "----------"
+
+        local i
+        for (( i=0; i<${#variant_tags[@]}; i++ )); do
+            local display_num=$((i + 1))
+            printf "%-4s %-28s %-12s %-18s %-15s %-10s %-14s %-10s\n" \
+                "$display_num)" \
+                "$model:${variant_tags[$i]}" \
+                "${variant_params[$i]}" \
+                "${variant_quantizations[$i]}" \
+                "${variant_contexts[$i]}" \
+                "${variant_vrams[$i]}" \
+                "${variant_tool_callings[$i]}" \
+                "${variant_sizes[$i]}"
+        done
+
+        echo
+        print_message "$YELLOW" "Select a variant number, press Enter for 1, or [q] Quit"
+        printf "Enter choice: "
+
+        local input
+        read -r input
+        if [ -z "$input" ]; then
+            input=1
+        fi
+
+        case "$input" in
+            q|Q)
+                print_message "$YELLOW" "Exiting..."
+                exit 0
+                ;;
+        esac
+
+        if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "${#variant_tags[@]}" ]; then
+            local selected_variant_idx=$((input - 1))
+            selected_variant="${variant_tags[$selected_variant_idx]}"
+            selected_model_reference="ai/$model"
+            if [ "$selected_variant" != "latest" ]; then
+                selected_model_reference="${selected_model_reference}:${selected_variant}"
+            fi
+            selected_ollama_model="$model"
+            if [ "$selected_variant" != "latest" ]; then
+                selected_ollama_model="${model}-${selected_variant}"
+            fi
+            break
+        fi
+
+        print_message "$RED" "❌ Invalid selection. Please enter a number between 1 and ${#variant_tags[@]}"
+        sleep 1
+    done
+}
+
+if [ "$APP_ACTION" = "check" ]; then
+    display_downloaded_models
+    exit 0
+fi
+
 fetch_models_from_dockerhub
 
 # Pagination settings
-MODELS_PER_PAGE=10
+MODELS_PER_PAGE=20
 total_models=${#model_names[@]}
 total_pages=$(( (total_models + MODELS_PER_PAGE - 1) / MODELS_PER_PAGE ))
 current_page=1
@@ -166,7 +838,7 @@ current_page=1
 display_page() {
     clear
     print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
-    print_message "$GREEN" "║            GGUF Model Downloader via Docker                    ║"
+    print_message "$GREEN" "║                 Docker Model Downloader                        ║"
     print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
     echo
     print_message "$GREEN" "📋 Available Docker AI Models (Page $current_page of $total_pages):"
@@ -189,9 +861,11 @@ display_page() {
         local display_num=$((i + 1))
         # Format pulls with comma separators for readability
         local formatted_pulls=$(printf "%'d" "${model_pulls[$i]}" 2>/dev/null || echo "${model_pulls[$i]}")
+        local display_name
+        display_name=$(truncate_text "${model_names[$i]}" 27)
         printf "%-4s %-27s %6s %10s   %s\n" \
             "$display_num)" \
-            "${model_names[$i]}" \
+            "$display_name" \
             "${model_stars[$i]}" \
             "$formatted_pulls" \
             "${model_descriptions[$i]}"
@@ -201,7 +875,7 @@ display_page() {
     print_message "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     local start_num=$((start_idx + 1))
     local end_num=$end_idx
-    print_message "$YELLOW" "Navigation: [↑] Previous  [↓] Next  [Type number 1-$total_models + Enter] Select  [q] Quit"
+    print_message "$YELLOW" "Navigation: [←] Previous  [→] Next  [Type number 1-$total_models + Enter] Select  [q] Quit"
     print_message "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
@@ -228,6 +902,9 @@ read_key() {
 
 # Interactive selection loop
 selected_model=""
+selected_variant=""
+selected_model_reference=""
+selected_ollama_model=""
 while true; do
     display_page
 
@@ -315,18 +992,19 @@ while true; do
 done
 
 echo
-print_message "$GREEN" "✅ You selected: $selected_model"
+print_message "$GREEN" "✅ You selected model: $selected_model"
+fetch_variants_for_model "$selected_model"
+select_variant_for_model "$selected_model"
+
+echo
+print_message "$GREEN" "✅ You selected variant: ${selected_model}:${selected_variant}"
 print_message "$YELLOW" "📥 Starting download..."
 echo
 
 # Download the model using docker
-docker_command="docker model pull ai/$selected_model"
-print_message "$YELLOW" "Running: $docker_command"
-echo
-
-if eval "$docker_command"; then
+if pull_model_with_retries "$selected_model_reference"; then
     echo
-    print_message "$GREEN" "✅ Successfully downloaded model: $selected_model"
+    print_message "$GREEN" "✅ Successfully downloaded model: $selected_model_reference"
     echo
 
     # Locate the downloaded GGUF files
@@ -352,36 +1030,26 @@ if eval "$docker_command"; then
             echo
             print_message "$GREEN" "📁 GGUF file(s) found: ${#gguf_files[@]} file(s)"
 
-            # Try to match using gguf_dump metadata if available
-            if [ "$GGUF_TOOL" = "gguf_dump" ]; then
-                print_message "$YELLOW" "🔍 Using gguf_dump to match model metadata for '$selected_model'..."
-                declare -a matches=()
-                lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
-                for f in "${gguf_files[@]}"; do
-                    meta=$(LC_ALL=C gguf_dump "$f" 2>/dev/null | LC_ALL=C tr '[:upper:]' '[:lower:]' || true)
-                    if [ -n "${meta}" ]; then
-                        SELECTED_NORM=$(printf "%s" "$lower_selected" | tr -d "[:space:]" | tr -cd "[:alnum:]")
-                        if printf "%s" "$meta" | grep -F -q "$SELECTED_NORM"; then
+            print_message "$YELLOW" "🔍 Using $GGUF_TOOL to match model metadata for '$selected_model'..."
+            declare -a matches=()
+            selected_norm=$(normalize_alnum_lower "$selected_model")
+            for f in "${gguf_files[@]}"; do
+                meta=$(extract_gguf_metadata "$f")
+                if [ -n "${meta}" ]; then
+                    meta_norm=$(normalize_alnum_lower "$meta")
+                    if printf "%s" "$meta_norm" | grep -F -q "$selected_norm"; then
                         matches+=("$f")
-                        fi
                     fi
-                done
-                if [ ${#matches[@]} -gt 0 ]; then
-                    IFS=$'\n' sorted_gguf_files=($(
-                        for f in "${matches[@]}"; do
-                            echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                        done | sort -rn | cut -d'|' -f2
-                    ))
-                else
-                    # fallback to size sorting of all candidates
-                    IFS=$'\n' sorted_gguf_files=($(
-                        for f in "${gguf_files[@]}"; do
-                            echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                        done | sort -rn | cut -d'|' -f2
-                    ))
                 fi
+            done
+            if [ ${#matches[@]} -gt 0 ]; then
+                IFS=$'\n' sorted_gguf_files=($(
+                    for f in "${matches[@]}"; do
+                        echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                    done | sort -rn | cut -d'|' -f2
+                ))
             else
-                print_message "$YELLOW" "gguf_dump not found; using size heuristic"
+                # fallback to size sorting of all candidates
                 IFS=$'\n' sorted_gguf_files=($(
                     for f in "${gguf_files[@]}"; do
                         echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
@@ -444,8 +1112,8 @@ if eval "$docker_command"; then
                 echo
             fi
 
-            echo "   2. Import to Ollama: ollama create $selected_model -f Modelfile"
-            echo "   3. Run it: ollama run $selected_model"
+            echo "   2. Import to Ollama: ollama create $selected_ollama_model -f Modelfile"
+            echo "   3. Run it: ollama run $selected_ollama_model"
 
             print_message "$YELLOW" "   ℹ️  Note: Ollama will copy the GGUF files to its own storage (~/.ollama/models)"
 
@@ -469,65 +1137,32 @@ if eval "$docker_command"; then
                 echo
                 print_message "$GREEN" "📁 GGUF file(s) found: ${#gguf_files_all[@]} file(s)"
 
-                # Try to match using gguf_dump metadata if available (full scan)
-                if [ "$GGUF_TOOL" = "gguf_dump" ]; then
-                    print_message "$YELLOW" "🔍 Using gguf_dump to match model metadata for '$selected_model' (full scan)..."
-                    declare -a matches_all=()
-                    lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
-                    for f in "${gguf_files_all[@]}"; do
-                        meta=$(LC_ALL=C gguf_dump "$f" 2>/dev/null | LC_ALL=C tr '[:upper:]' '[:lower:]' || true)
-                        if [ -n "${meta}" ]; then
-                        SELECTED_NORM=$(printf "%s" "$lower_selected" | tr -d "[:space:]" | tr -cd "[:alnum:]")
-                        if printf "%s" "$meta" | grep -F -q "$SELECTED_NORM"; then
+                print_message "$YELLOW" "🔍 Using $GGUF_TOOL to match model metadata for '$selected_model' (full scan)..."
+                declare -a matches_all=()
+                selected_norm=$(normalize_alnum_lower "$selected_model")
+                for f in "${gguf_files_all[@]}"; do
+                    meta=$(extract_gguf_metadata "$f")
+                    if [ -n "${meta}" ]; then
+                        meta_norm=$(normalize_alnum_lower "$meta")
+                        if printf "%s" "$meta_norm" | grep -F -q "$selected_norm"; then
                             matches_all+=("$f")
                         fi
-                        fi
-                    done
-                    if [ ${#matches_all[@]} -gt 0 ]; then
-                        IFS=$'
-' sorted_gguf_files_all=($(
-                            for f in "${matches_all[@]}"; do
-                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                            done | sort -rn | cut -d'|' -f2
-                        ))
-                    else
-                        IFS=$'
-' sorted_gguf_files_all=($(
-                            for f in "${gguf_files_all[@]}"; do
-                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                            done | sort -rn | cut -d'|' -f2
-                        ))
                     fi
+                done
+                if [ ${#matches_all[@]} -gt 0 ]; then
+                    IFS=$'
+' sorted_gguf_files_all=($(
+                        for f in "${matches_all[@]}"; do
+                            echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                        done | sort -rn | cut -d'|' -f2
+                    ))
                 else
-                    print_message "$YELLOW" "🔍 Using strings to extract general.name (llama-gguf present, full scan)..."
-                    declare -a matches_all=()
-                    lower_selected=$(printf "%s" "$selected_model" | tr '[:upper:]' '[:lower:]')
-                    for f in "${gguf_files_all[@]}"; do
-                        meta=$(LC_ALL=C head -c "$HEADER_BYTES" "$f" 2>/dev/null | LC_ALL=C strings | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -d '[:space:]' | LC_ALL=C tr -cd '[:alnum:]' 2>/dev/null || true)
-                    # meta now normalized (alphanumeric, lowercased, header-only)
-                    # meta now normalized (alphanumeric, lowercased)
-                        if [ -n "${meta}" ]; then
-                        SELECTED_NORM=$(printf "%s" "$lower_selected" | tr -d "[:space:]" | tr -cd "[:alnum:]")
-                        if printf "%s" "$meta" | grep -F -q "$SELECTED_NORM"; then
-                            matches_all+=("$f")
-                        fi
-                        fi
-                    done
-                    if [ ${#matches_all[@]} -gt 0 ]; then
-                        IFS=$'
+                    IFS=$'
 ' sorted_gguf_files_all=($(
-                            for f in "${matches_all[@]}"; do
-                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                            done | sort -rn | cut -d'|' -f2
-                        ))
-                    else
-                        IFS=$'
-' sorted_gguf_files_all=($(
-                            for f in "${gguf_files_all[@]}"; do
-                                echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
-                            done | sort -rn | cut -d'|' -f2
-                        ))
-                    fi
+                        for f in "${gguf_files_all[@]}"; do
+                            echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
+                        done | sort -rn | cut -d'|' -f2
+                    ))
                 fi
 
                 for gguf_file in "${sorted_gguf_files_all[@]}"; do
@@ -578,8 +1213,8 @@ if eval "$docker_command"; then
                     echo
                 fi
 
-                echo "   2. Import to Ollama: ollama create $selected_model -f Modelfile"
-                echo "   3. Run it: ollama run $selected_model"
+                echo "   2. Import to Ollama: ollama create $selected_ollama_model -f Modelfile"
+                echo "   3. Run it: ollama run $selected_ollama_model"
 
                 print_message "$YELLOW" "   ℹ️  Note: Ollama will copy the GGUF files to its own storage (~/.ollama/models)"
                 echo "      After successful import, you can safely delete the Docker blobs to save space."
@@ -600,6 +1235,6 @@ if eval "$docker_command"; then
     fi
 else
     echo
-    print_message "$RED" "❌ Failed to download model: $selected_model"
+    print_message "$RED" "❌ Failed to download model: $selected_model_reference"
     exit 1
 fi
