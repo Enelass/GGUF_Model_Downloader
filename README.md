@@ -11,7 +11,7 @@ Why this exists:
   - `docker model pull` can fail on unreliable or corporate networks; this script automatically retries downloads.
   - Docker can be an allowed route for GGUF downloads where Ollama, Hugging Face, or ModelScope are blocked.
   - Downloaded Docker GGUF blobs can then be reused in Ollama, llama.cpp, or other GGUF-compatible apps.
-  - The script identifies GGUF blobs to simplify importing into Ollama or llama.cpp using `llama-gguf` from Homebrew's `llama.cpp` package, or `gguf_dump` when available.
+  - The script identifies GGUF blobs to simplify importing into Ollama or llama.cpp, with richer metadata when `llama-gguf` or `gguf_dump` is available.
 
 
 ![Bash](https://img.shields.io/badge/bash-3.2%2B-4EAA25?logo=gnu-bash&logoColor=white)
@@ -27,8 +27,8 @@ Interactive script to download GGUF AI models via Docker, locate the downloaded 
 
 - **Download Docker AI models**: browse the live Docker Hub `ai/*` catalog, select a model, inspect all available tags/variants, and pull the exact variant you want.
 - **Recover from flaky pulls**: retries `docker model pull` failures automatically, which helps on unreliable or corporate networks.
-- **Inspect local downloads**: scan `~/.docker/models/blobs/sha256/` for completed GGUF blobs, skip incomplete downloads, and show useful metadata such as role, architecture, size, context length, quantization, tensor count, and cropped path.
-- **Use Homebrew llama.cpp metadata tooling**: detects `llama-gguf` from `brew install llama.cpp`, while still using `gguf_dump` when available.
+- **Inspect local downloads**: scan `~/.docker/models/blobs/sha256/` for completed GGUF blobs, list incomplete downloads separately, and show useful metadata such as role, architecture, size, context length, quantization, tensor count, and cropped path.
+- **Use optional llama.cpp metadata tooling**: detects `llama-gguf` from `brew install llama.cpp`, while still using `gguf_dump` when available. Downloads do not require either tool.
 - **Reuse Docker GGUF blobs elsewhere**: prints Ollama import commands and file locations so downloaded Docker models can be used with Ollama, llama.cpp, or other GGUF-compatible runtimes.
 - **macOS compatibility filtering**: hides vLLM-only Docker model entries on macOS because those variants are not compatible there.
 
@@ -37,8 +37,8 @@ Interactive script to download GGUF AI models via Docker, locate the downloaded 
 - **Bash** (macOS ships Bash 3.2)
 - **Docker Desktop** (required) must be installed and running
 - **jq** (used to parse the Docker Hub API)
-- **llama-gguf** (from `brew install llama.cpp`) or **gguf_dump** must be installed and on PATH; used to identify GGUF metadata
 - **Ollama** (optional) to run the downloaded models
+- **llama-gguf** (from `brew install llama.cpp`) or **gguf_dump** (optional) for richer downloaded-model metadata and more precise GGUF matching
 
 ## Installation & Usage
 
@@ -60,8 +60,9 @@ bash <(curl -s https://raw.githubusercontent.com/Enelass/Docker_Model_Downloader
 - Shows 20 models per page and crops long model names so the table stays readable
 - Lists Docker model variants, not only the default tag, with parameters, quantization, context, VRAM, tool-calling, and size when Docker metadata provides it
 - Filters vLLM-only entries on macOS because they are not compatible there
-- Checks locally downloaded Docker GGUF blobs without starting a download, including grouped metadata and cropped paths
+- Checks locally downloaded Docker GGUF blobs without starting a download, including grouped metadata, cropped paths, incomplete downloads, and an optional purge action
 - Retries failed model downloads automatically
+- Allows cancelling an active download with Ctrl+C and returning to variant selection
 - Shows spinner feedback while retrieving models, variants, and local metadata
 - Automatic GGUF file detection with `llama-gguf` or `gguf_dump`
 - Ready-to-use Ollama import commands

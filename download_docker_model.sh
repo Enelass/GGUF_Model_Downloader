@@ -13,6 +13,8 @@ MIN_SIZE_BYTES=${MIN_SIZE_BYTES:-1024}  # ignore tiny files
 DOWNLOAD_RETRY_DELAY_SECONDS=${DOWNLOAD_RETRY_DELAY_SECONDS:-5}
 DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-10}
 PATH_DISPLAY_WIDTH=${PATH_DISPLAY_WIDTH:-80}
+ACTIVE_PULL_PID=""
+DOWNLOAD_CANCELLED=0
 
 IS_MACOS=0
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -159,15 +161,43 @@ crop_middle() {
 pull_model_with_retries() {
     local model_reference="$1"
     local attempt=0
+    local status=0
+
+    cancel_active_download() {
+        DOWNLOAD_CANCELLED=1
+        echo
+        print_message "$YELLOW" "Download cancellation requested. Stopping docker model pull..."
+        if [ -n "${ACTIVE_PULL_PID:-}" ] && kill -0 "$ACTIVE_PULL_PID" 2>/dev/null; then
+            kill -TERM "$ACTIVE_PULL_PID" 2>/dev/null || true
+        fi
+    }
 
     while true; do
+        DOWNLOAD_CANCELLED=0
+
         if [ "$attempt" -eq 0 ]; then
             print_message "$YELLOW" "Running: docker model pull $model_reference"
         else
             print_message "$YELLOW" "Retry $attempt/$DOWNLOAD_MAX_RETRIES: docker model pull $model_reference"
         fi
 
-        if docker model pull "$model_reference"; then
+        trap cancel_active_download INT
+        docker model pull "$model_reference" &
+        ACTIVE_PULL_PID=$!
+        if wait "$ACTIVE_PULL_PID"; then
+            status=0
+        else
+            status=$?
+        fi
+        ACTIVE_PULL_PID=""
+        trap - INT
+
+        if [ "$DOWNLOAD_CANCELLED" -eq 1 ] || [ "$status" -eq 130 ] || [ "$status" -eq 143 ]; then
+            print_message "$YELLOW" "Download cancelled."
+            return 130
+        fi
+
+        if [ "$status" -eq 0 ]; then
             return 0
         fi
 
@@ -251,10 +281,10 @@ fi
 #print_message "$GREEN" "✅ jq command found!"
 #echo
 
-# Display introduction
-# Detect available GGUF tooling: prefer gguf_dump when present; Homebrew llama.cpp provides llama-gguf.
+# Detect optional GGUF tooling: prefer gguf_dump when present; Homebrew llama.cpp provides llama-gguf.
 GGUF_TOOL=""
 GGUF_TOOL_MESSAGE=""
+GGUF_TOOL_COLOR="$GREEN"
 if command -v gguf_dump >/dev/null 2>&1; then
     GGUF_TOOL="gguf_dump"
     GGUF_TOOL_MESSAGE="✅ GGUF metadata: gguf_dump"
@@ -262,9 +292,8 @@ elif command -v llama-gguf >/dev/null 2>&1; then
     GGUF_TOOL="llama-gguf"
     GGUF_TOOL_MESSAGE="✅ GGUF metadata: llama-gguf"
 else
-    print_message "$RED" "❌ Error: gguf_dump or llama-gguf is required to identify GGUF metadata."
-    print_message "$YELLOW" "Install llama.cpp (macOS: brew install llama.cpp) and re-run the script."
-    exit 1
+    GGUF_TOOL_MESSAGE="⚠️  GGUF metadata tools not found. Downloads still work; install llama.cpp for richer local metadata."
+    GGUF_TOOL_COLOR="$YELLOW"
 fi
 
 render_startup_menu() {
@@ -280,7 +309,7 @@ render_startup_menu() {
     echo
     print_message "$GREEN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
-    print_message "$GREEN" "$GGUF_TOOL_MESSAGE"
+    print_message "$GGUF_TOOL_COLOR" "$GGUF_TOOL_MESSAGE"
     echo
 
     if [ "$selected" -eq 1 ]; then
@@ -403,11 +432,13 @@ display_downloaded_models() {
     start_spinner "Scanning local Docker model blobs..."
 
     declare -a downloaded_gguf_files=()
+    declare -a incomplete_download_files=()
     local incomplete_count=0
     while IFS= read -r file; do
         case "$file" in
             *.incomplete)
                 incomplete_count=$((incomplete_count + 1))
+                incomplete_download_files+=("$file")
                 continue
                 ;;
         esac
@@ -422,18 +453,26 @@ display_downloaded_models() {
 
     stop_spinner
 
-    if [ ${#downloaded_gguf_files[@]} -eq 0 ]; then
+    if [ ${#downloaded_gguf_files[@]} -eq 0 ] && [ "$incomplete_count" -eq 0 ]; then
         print_message "$YELLOW" "No GGUF files found in $blobs_dir."
         return
     fi
 
+    if [ ${#downloaded_gguf_files[@]} -eq 0 ]; then
+        print_message "$YELLOW" "No completed GGUF files found in $blobs_dir."
+        echo
+    else
     IFS=$'\n' sorted_downloaded_gguf_files=($(
         for f in "${downloaded_gguf_files[@]}"; do
             echo "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)|$f"
         done | sort -rn | cut -d'|' -f2
     ))
 
-    start_spinner "Reading GGUF metadata..."
+    if [ -n "$GGUF_TOOL" ]; then
+        start_spinner "Reading GGUF metadata..."
+    else
+        start_spinner "Reading GGUF headers..."
+    fi
 
     declare -a group_names=()
     declare -a record_groups=()
@@ -557,6 +596,55 @@ display_downloaded_models() {
         done
         echo
     done
+    fi
+
+    if [ "$incomplete_count" -gt 0 ]; then
+        print_message "$YELLOW" "Incomplete downloads"
+        printf "  %-7s %s\n" "Size" "Path"
+
+        local incomplete_file
+        for incomplete_file in "${incomplete_download_files[@]}"; do
+            printf "  %-7s %s\n" \
+                "$(du -h "$incomplete_file" 2>/dev/null | awk '{print $1}')" \
+                "$(crop_middle "$incomplete_file" "$PATH_DISPLAY_WIDTH")"
+        done
+        echo
+
+        print_message "$YELLOW" "Press [p] to purge incomplete downloads, or Enter/[q] to exit."
+        printf "Enter choice: "
+
+        local purge_choice
+        if ! read -r purge_choice; then
+            return
+        fi
+
+        case "$purge_choice" in
+            p|P)
+                print_message "$YELLOW" "Delete $incomplete_count incomplete download file(s)? [y/N]"
+                printf "Confirm: "
+                local confirm_purge
+                if ! read -r confirm_purge; then
+                    print_message "$YELLOW" "Purge cancelled."
+                    return
+                fi
+
+                case "$confirm_purge" in
+                    y|Y|yes|YES)
+                        local purged_count=0
+                        for incomplete_file in "${incomplete_download_files[@]}"; do
+                            if rm -f -- "$incomplete_file"; then
+                                purged_count=$((purged_count + 1))
+                            fi
+                        done
+                        print_message "$GREEN" "Purged $purged_count incomplete download file(s)."
+                        ;;
+                    *)
+                        print_message "$YELLOW" "Purge cancelled."
+                        ;;
+                esac
+                ;;
+        esac
+    fi
 }
 
 fetch_models_from_dockerhub() {
@@ -1001,8 +1089,30 @@ print_message "$GREEN" "✅ You selected variant: ${selected_model}:${selected_v
 print_message "$YELLOW" "📥 Starting download..."
 echo
 
-# Download the model using docker
-if pull_model_with_retries "$selected_model_reference"; then
+# Download the model using docker. Ctrl+C cancels the active pull and returns here.
+while true; do
+    if pull_model_with_retries "$selected_model_reference"; then
+        break
+    else
+        pull_status=$?
+    fi
+
+    if [ "$pull_status" -eq 130 ]; then
+        echo
+        print_message "$YELLOW" "Select another variant for $selected_model, or [q] Quit."
+        select_variant_for_model "$selected_model"
+        echo
+        print_message "$GREEN" "✅ You selected variant: ${selected_model}:${selected_variant}"
+        print_message "$YELLOW" "📥 Starting download..."
+        echo
+        continue
+    fi
+
+    echo
+    print_message "$RED" "❌ Failed to download model: $selected_model_reference"
+    exit 1
+done
+
     echo
     print_message "$GREEN" "✅ Successfully downloaded model: $selected_model_reference"
     echo
@@ -1030,18 +1140,22 @@ if pull_model_with_retries "$selected_model_reference"; then
             echo
             print_message "$GREEN" "📁 GGUF file(s) found: ${#gguf_files[@]} file(s)"
 
-            print_message "$YELLOW" "🔍 Using $GGUF_TOOL to match model metadata for '$selected_model'..."
             declare -a matches=()
-            selected_norm=$(normalize_alnum_lower "$selected_model")
-            for f in "${gguf_files[@]}"; do
-                meta=$(extract_gguf_metadata "$f")
-                if [ -n "${meta}" ]; then
-                    meta_norm=$(normalize_alnum_lower "$meta")
-                    if printf "%s" "$meta_norm" | grep -F -q "$selected_norm"; then
-                        matches+=("$f")
+            if [ -n "$GGUF_TOOL" ]; then
+                print_message "$YELLOW" "🔍 Using $GGUF_TOOL to match model metadata for '$selected_model'..."
+                selected_norm=$(normalize_alnum_lower "$selected_model")
+                for f in "${gguf_files[@]}"; do
+                    meta=$(extract_gguf_metadata "$f")
+                    if [ -n "${meta}" ]; then
+                        meta_norm=$(normalize_alnum_lower "$meta")
+                        if printf "%s" "$meta_norm" | grep -F -q "$selected_norm"; then
+                            matches+=("$f")
+                        fi
                     fi
-                fi
-            done
+                done
+            else
+                print_message "$YELLOW" "🔍 GGUF metadata tools not found; using recent GGUF files sorted by size."
+            fi
             if [ ${#matches[@]} -gt 0 ]; then
                 IFS=$'\n' sorted_gguf_files=($(
                     for f in "${matches[@]}"; do
@@ -1137,18 +1251,22 @@ if pull_model_with_retries "$selected_model_reference"; then
                 echo
                 print_message "$GREEN" "📁 GGUF file(s) found: ${#gguf_files_all[@]} file(s)"
 
-                print_message "$YELLOW" "🔍 Using $GGUF_TOOL to match model metadata for '$selected_model' (full scan)..."
                 declare -a matches_all=()
-                selected_norm=$(normalize_alnum_lower "$selected_model")
-                for f in "${gguf_files_all[@]}"; do
-                    meta=$(extract_gguf_metadata "$f")
-                    if [ -n "${meta}" ]; then
-                        meta_norm=$(normalize_alnum_lower "$meta")
-                        if printf "%s" "$meta_norm" | grep -F -q "$selected_norm"; then
-                            matches_all+=("$f")
+                if [ -n "$GGUF_TOOL" ]; then
+                    print_message "$YELLOW" "🔍 Using $GGUF_TOOL to match model metadata for '$selected_model' (full scan)..."
+                    selected_norm=$(normalize_alnum_lower "$selected_model")
+                    for f in "${gguf_files_all[@]}"; do
+                        meta=$(extract_gguf_metadata "$f")
+                        if [ -n "${meta}" ]; then
+                            meta_norm=$(normalize_alnum_lower "$meta")
+                            if printf "%s" "$meta_norm" | grep -F -q "$selected_norm"; then
+                                matches_all+=("$f")
+                            fi
                         fi
-                    fi
-                done
+                    done
+                else
+                    print_message "$YELLOW" "🔍 GGUF metadata tools not found; using all GGUF files sorted by size."
+                fi
                 if [ ${#matches_all[@]} -gt 0 ]; then
                     IFS=$'
 ' sorted_gguf_files_all=($(
@@ -1233,8 +1351,3 @@ if pull_model_with_retries "$selected_model_reference"; then
         print_message "$YELLOW" "⚠️  Docker models directory not found: $blobs_dir"
         echo
     fi
-else
-    echo
-    print_message "$RED" "❌ Failed to download model: $selected_model_reference"
-    exit 1
-fi

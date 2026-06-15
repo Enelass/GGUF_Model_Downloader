@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- GGUF metadata tools are now optional and no longer block browsing or downloading Docker models.
+
+### Added
+- Local downloaded-model checks now list incomplete downloads and offer an optional purge action.
+- Active model downloads can now be cancelled with Ctrl+C, returning to variant selection without stopping Docker Desktop.
+
 ## [0.6.0] - 2026-06-15
 
 ### Added
