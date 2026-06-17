@@ -21,7 +21,7 @@ Why this exists:
 
 Interactive script to download GGUF AI models via Docker, locate the downloaded GGUF files, and import them into other local runtimes.
 
-![Docker Model Downloader demo](assets/DockerGGUFDownloader-demo.gif)
+![Docker Model Downloader demo](assets/DockerModelDownloader-small.gif)
 
 ## Capabilities
 
