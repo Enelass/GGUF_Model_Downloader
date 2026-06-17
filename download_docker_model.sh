@@ -13,6 +13,7 @@ MIN_SIZE_BYTES=${MIN_SIZE_BYTES:-1024}  # ignore tiny files
 DOWNLOAD_RETRY_DELAY_SECONDS=${DOWNLOAD_RETRY_DELAY_SECONDS:-5}
 DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-10}
 PATH_DISPLAY_WIDTH=${PATH_DISPLAY_WIDTH:-80}
+KOFI_URL=${KOFI_URL:-"https://ko-fi.com/enelass"}
 ACTIVE_PULL_PID=""
 DOWNLOAD_CANCELLED=0
 
@@ -258,6 +259,8 @@ print_banner() {
     print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
     print_message "$GREEN" "║                 Docker Model Downloader                        ║"
     print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
+    echo
+    print_message "$YELLOW" "   Donate to support this work: $KOFI_URL"
 }
 
 # Check if docker command exists
@@ -850,9 +853,7 @@ select_variant_for_model() {
 
     while true; do
         clear
-        print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
-        print_message "$GREEN" "║                 Docker Model Downloader                        ║"
-        print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
+        print_banner
         echo
         print_message "$GREEN" "📋 Available variants for ai/$model"
         echo
@@ -925,9 +926,7 @@ current_page=1
 # Function to display models for current page
 display_page() {
     clear
-    print_message "$GREEN" "╔════════════════════════════════════════════════════════════════╗"
-    print_message "$GREEN" "║                 Docker Model Downloader                        ║"
-    print_message "$GREEN" "╚════════════════════════════════════════════════════════════════╝"
+    print_banner
     echo
     print_message "$GREEN" "📋 Available Docker AI Models (Page $current_page of $total_pages):"
     echo

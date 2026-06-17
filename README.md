@@ -23,6 +23,10 @@ Interactive script to download GGUF AI models via Docker, locate the downloaded 
 
 ![Docker Model Downloader demo](assets/DockerModelDownloader-small.gif)
 
+## Support
+
+Donate to support this work: [Ko-fi Enelass](https://ko-fi.com/enelass)
+
 ## Capabilities
 
 - **Download Docker AI models**: browse the live Docker Hub `ai/*` catalog, select a model, inspect all available tags/variants, and pull the exact variant you want.
