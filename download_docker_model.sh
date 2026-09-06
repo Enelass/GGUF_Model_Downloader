@@ -656,69 +656,118 @@ fetch_models_from_dockerhub() {
     model_pulls=()
     model_descriptions=()
 
-    local page=1
     local page_size=100
     local max_attempts=3
     local skipped_incompatible_models=0
 
+    # Docker Hub refuses anonymous listing requests once the pagination offset
+    # reaches this value, answering 403 with:
+    #   {"message":"pagination offset too large for anonymous requests; ..."}
+    # Walking the listing once ascending and once descending keeps every request
+    # below that offset, so up to 2 x ANON_OFFSET_LIMIT repositories stay
+    # reachable without credentials.
+    local anon_offset_limit=100
+    local seen_names=" "
+    local total_count=0
+    local collected=0
+
     start_spinner "Retrieving model list from Docker Hub..."
 
-    while true; do
-        local url="https://hub.docker.com/v2/repositories/ai?page_size=${page_size}&page=${page}&ordering=last_updated"
+    local ordering
+    for ordering in "last_updated" "-last_updated"; do
+        local page=1
 
-        local response=""
-        local attempt
-        for attempt in $(seq 1 "$max_attempts"); do
-            if response=$(curl -fsSL "$url" -H 'accept: */*' 2>/dev/null); then
+        while true; do
+            if [ $(( (page - 1) * page_size )) -ge "$anon_offset_limit" ]; then
                 break
             fi
-            sleep 0.4
-        done
 
-        if [ -z "$response" ]; then
-            stop_spinner
-            print_message "$RED" "❌ Failed to fetch model list from Docker Hub (page $page)."
-            print_message "$YELLOW" "Check your internet connection and try again."
-            exit 1
-        fi
+            local url="https://hub.docker.com/v2/repositories/ai?page_size=${page_size}&page=${page}&ordering=${ordering}"
 
-        if ! echo "$response" | jq -e '.results and (.results|type=="array")' >/dev/null 2>&1; then
-            stop_spinner
-            print_message "$RED" "❌ Docker Hub returned an unexpected response (page $page)."
-            print_message "$YELLOW" "Try again later (you may be rate-limited)."
-            exit 1
-        fi
+            local response=""
+            local http_code=""
+            local attempt
+            for attempt in $(seq 1 "$max_attempts"); do
+                local body_file
+                body_file=$(mktemp)
+                http_code=$(curl -sSL "$url" -H 'accept: */*' -o "$body_file" -w '%{http_code}' 2>/dev/null || echo "000")
+                response=$(cat "$body_file")
+                rm -f "$body_file"
 
-        local page_count
-        page_count=$(echo "$response" | jq -r '.results | length')
-        if [ "$page_count" -eq 0 ]; then
-            break
-        fi
+                if [ "$http_code" = "200" ] && [ -n "$response" ]; then
+                    break
+                fi
+                response=""
+                sleep 0.4
+            done
 
-        while IFS='|' read -r name stars pulls description; do
-            if is_incompatible_model_for_platform "$name"; then
-                skipped_incompatible_models=$((skipped_incompatible_models + 1))
-                continue
+            if [ -z "$response" ]; then
+                stop_spinner
+                print_message "$RED" "❌ Failed to fetch model list from Docker Hub (page $page, HTTP ${http_code:-000})."
+                if [ "$http_code" = "000" ]; then
+                    print_message "$YELLOW" "Check your internet connection (or proxy settings) and try again."
+                else
+                    print_message "$YELLOW" "Docker Hub rejected the request. Try again later (you may be rate-limited)."
+                fi
+                exit 1
             fi
 
-            model_names+=("$name")
-            model_stars+=("$stars")
-            model_pulls+=("$pulls")
-            model_descriptions+=("$description")
-        done < <(
-            echo "$response" | jq -r '.results[] | "\(.name)|\(.star_count // 0)|\(.pull_count // 0)|\(.description // "")"'
-        )
+            if ! echo "$response" | jq -e '.results and (.results|type=="array")' >/dev/null 2>&1; then
+                stop_spinner
+                print_message "$RED" "❌ Docker Hub returned an unexpected response (page $page)."
+                print_message "$YELLOW" "Try again later (you may be rate-limited)."
+                exit 1
+            fi
 
-        local next_url
-        next_url=$(echo "$response" | jq -r '.next')
-        if [ "$next_url" = "null" ] || [ -z "$next_url" ]; then
+            total_count=$(echo "$response" | jq -r '.count // 0')
+
+            local page_count
+            page_count=$(echo "$response" | jq -r '.results | length')
+            if [ "$page_count" -eq 0 ]; then
+                break
+            fi
+
+            while IFS='|' read -r name stars pulls description; do
+                # The two ordering passes overlap when the listing is small.
+                case "$seen_names" in
+                    *" $name "*) continue ;;
+                esac
+                seen_names="${seen_names}${name} "
+                collected=$((collected + 1))
+
+                if is_incompatible_model_for_platform "$name"; then
+                    skipped_incompatible_models=$((skipped_incompatible_models + 1))
+                    continue
+                fi
+
+                model_names+=("$name")
+                model_stars+=("$stars")
+                model_pulls+=("$pulls")
+                model_descriptions+=("$description")
+            done < <(
+                echo "$response" | jq -r '.results[] | "\(.name)|\(.star_count // 0)|\(.pull_count // 0)|\(.description // "")"'
+            )
+
+            local next_url
+            next_url=$(echo "$response" | jq -r '.next')
+            if [ "$next_url" = "null" ] || [ -z "$next_url" ]; then
+                break
+            fi
+
+            page=$((page + 1))
+        done
+
+        # Everything is already in hand; skip the reverse pass.
+        if [ "$total_count" -gt 0 ] && [ "$collected" -ge "$total_count" ]; then
             break
         fi
-
-        page=$((page + 1))
     done
 
     stop_spinner
+
+    if [ "$total_count" -gt 0 ] && [ "$collected" -lt "$total_count" ]; then
+        print_message "$YELLOW" "Showing $collected of $total_count models (Docker Hub caps anonymous listing at $((anon_offset_limit * 2))). Sign in to Docker Hub to see the rest."
+    fi
 
     if [ "$skipped_incompatible_models" -gt 0 ]; then
         print_message "$YELLOW" "Filtered $skipped_incompatible_models vLLM model(s) on macOS."
