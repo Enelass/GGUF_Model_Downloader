@@ -12,6 +12,7 @@ Why this exists:
   - Docker can be an allowed route for GGUF downloads where Ollama, Hugging Face, or ModelScope are blocked.
   - Downloaded Docker GGUF blobs can then be reused in Ollama, llama.cpp, or other GGUF-compatible apps.
   - The script identifies GGUF blobs to simplify importing into Ollama or llama.cpp, with richer metadata when `llama-gguf` or `gguf_dump` is available.
+  - The catalog tells you whether a model will actually run on **your** machine before you spend the download on finding out.
 
 
 ![Bash](https://img.shields.io/badge/bash-3.2%2B-4EAA25?logo=gnu-bash&logoColor=white)
@@ -30,6 +31,9 @@ Donate to support this work: [Ko-fi Enelass](https://ko-fi.com/enelass)
 ## Capabilities
 
 - **Download Docker AI models**: browse the live Docker Hub `ai/*` catalog, select a model, inspect all available tags/variants, and pull the exact variant you want.
+- **See what fits your machine**: a **Fit** column rates every model against the memory actually available for weights on this box, and an estimated **tok/s** says whether it will feel usable. See [Fit and tok/s](#fit-and-toks).
+- **Search and filter**: `[f]` filters the catalog by name or description, `[r]` hides everything that will not run here, and the two compose.
+- **Progressive load**: the table appears in about 10 seconds while per-model sizes keep downloading in the background behind a progress bar; `[u]` folds in whatever has landed so far.
 - **Recover from flaky pulls**: retries `docker model pull` failures automatically, which helps on unreliable or corporate networks.
 - **Inspect local downloads**: scan `~/.docker/models/blobs/sha256/` for completed GGUF blobs, list incomplete downloads separately, and show useful metadata such as role, architecture, size, context length, quantization, tensor count, and cropped path.
 - **Use optional llama.cpp metadata tooling**: detects `llama-gguf` from `brew install llama.cpp`, while still using `gguf_dump` when available. Downloads do not require either tool.
@@ -61,7 +65,10 @@ bash <(curl -s https://raw.githubusercontent.com/Enelass/Docker_Model_Downloader
 
 - Fetches an up-to-date list of Docker Hub `ai/*` models every run
 - Starts with a keyboard-selectable action menu for downloading models or checking local downloads
-- Shows 20 models per page and crops long model names so the table stays readable
+- Shows the catalog as `#  Model Name  Parameters  Fit  tok/s  Pulls  Description`, adapting column widths to the terminal
+- Rates every model against the memory this machine can actually give to weights, with an estimated decode speed
+- Fills gaps in Docker's metadata from models.dev without ever overwriting what Docker reports
+- Renders the table after ~10 seconds and keeps sizing models in the background behind a progress bar
 - Lists Docker model variants, not only the default tag, with parameters, quantization, context, VRAM, tool-calling, and size when Docker metadata provides it
 - Filters vLLM-only entries on macOS because they are not compatible there
 - Checks locally downloaded Docker GGUF blobs without starting a download, including grouped metadata, cropped paths, incomplete downloads, and an optional purge action
@@ -71,11 +78,64 @@ bash <(curl -s https://raw.githubusercontent.com/Enelass/Docker_Model_Downloader
 - Automatic GGUF file detection with `llama-gguf` or `gguf_dump`
 - Ready-to-use Ollama import commands
 
+## Fit and tok/s
+
+The **Fit** column compares the smallest GGUF build a repo ships against the memory
+available for weights on this machine — on Apple Silicon that is the Metal wired limit
+(`iogpu.wired_limit_mb`, or ~75% of unified memory when unset), on Linux the NVIDIA VRAM
+reported by `nvidia-smi` when a card is present. A model needs roughly `size × 1.15 + 1 GB`
+resident once KV cache and runtime overhead are counted.
+
+| | Meaning |
+|---|---|
+| ✅ | fits comfortably — under 60% of the budget |
+| 🟡 | fits, but with little headroom for a long context |
+| 🟠 | over the accelerator budget; runs on CPU instead, slowly |
+| ❌ | larger than total memory — will not run |
+| `-` | no GGUF build published, so no verdict |
+| `..` | size still being fetched — press `[u]` to fold it in |
+
+The size shown is the **smallest** GGUF build in the repo, so the verdict is a best case;
+larger quantisations of the same model need more.
+
+**tok/s figures are estimates, not measurements.** They model decode as memory-bandwidth
+bound — `bandwidth × efficiency ÷ resident bytes`, with MoE models counted on their active
+experts only — and are capped at 200. A speed is shown only for models that fit the
+accelerator budget; past it the work moves to the CPU, which this model does not describe.
+Press `[h]` in the catalog for the detected specs and the thresholds in use.
+
+## Where the metadata comes from
+
+Everything in the table is derived from public APIs at runtime and cached for 7 days under
+`${XDG_CACHE_HOME:-~/.cache}/docker_model_downloader/`. No data is bundled with the script.
+
+| Column / value | Source | Notes |
+|---|---|---|
+| Model list, Pulls, Description | `hub.docker.com/v2/repositories/ai/?page_size=100` | Anonymous requests are refused past offset 100, so the catalog is assembled from two orderings |
+| Parameters | tag names from `hub.docker.com/v2/repositories/ai/<name>/tags` | Docker encodes size in the tag: `20b`, `120b`, `270m`, `1.7b`, `1t` |
+| MoE active parameters | the same tag names | `26b-a4b`, `2.4t-a95b` — feeds the speed estimate |
+| Model size (drives **Fit**) | `full_size` in that same tags response | Free: no extra request beyond the one already made for Parameters |
+| Which tags carry real GGUF weights | `registry-1.docker.io/v2/ai/<name>/manifests/<tag>`, token from `auth.docker.io` | Checks the `org.cncf.model.filepath` layer annotation. Needed because some model-looking tags ship only an MTP draft head or an `mmproj` projector — `ai/gemma4:12b-q8_0` is 611 MB, not 12B of weights |
+| Empty Parameters / Description cells only | `models.dev/api.json` | **Gap-fill only.** A value Docker provides is never overwritten |
+| Hardware specs | macOS: `sysctl hw.memsize machdep.cpu.brand_string hw.model iogpu.wired_limit_mb`, `system_profiler SPDisplaysDataType` · Linux: `/proc/meminfo`, `nvidia-smi` | Local probes; nothing leaves the machine |
+| Memory bandwidth | built-in lookup table keyed on the chip string | M4 Pro 273 GB/s, M4 Max 546 GB/s, RTX 4090 1008 GB/s, … Unknown chip → tok/s shows `-` rather than a fabricated number |
+| tok/s | **computed, not fetched** | See [Fit and tok/s](#fit-and-toks) |
+| Local blob metadata | `~/.docker/models/blobs/sha256/`, read with `llama-gguf` or `gguf_dump` when installed | Architecture, context length, quantization, tensor count |
+
+Caches: `param-ranges-v3.tsv` (one tab-separated record per model: name, parameter range,
+smallest GGUF bytes, that tag, MoE active percentage) and `models-dev.json`. Delete either
+to force a refetch; `[c]` clears filters, not caches.
+
 ## Navigation
 
 - **Startup menu**: Up/down arrows choose the action, Enter selects, and the downloader starts automatically after 5 seconds
 - **Model list**: Left/right arrows navigate pages
 - **Number + Enter**: Select model
+- **f**: Search by name or description
+- **r**: Toggle "only what fits this machine"
+- **h**: Hardware panel and Fit legend
+- **u**: Fold in sizes fetched in the background (shown only while a fetch is in flight)
+- **c**: Clear search and filters
 - **q**: Quit
 
 That's it. Run the script, pick a model, and follow the on-screen instructions.
