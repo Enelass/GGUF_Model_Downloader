@@ -5,6 +5,7 @@ clear
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
 NC='\033[0m' # No Color
 
 # Scanning performance tuning (bytes)
@@ -780,6 +781,557 @@ fetch_models_from_dockerhub() {
     fi
 }
 
+# --- Hardware fit ----------------------------------------------------------
+#
+# What decides whether a model runs is not its parameter count but how many
+# bytes of weights must be resident. On Apple Silicon the binding limit is the
+# Metal wired limit - how much of unified memory the GPU is allowed to pin -
+# rather than total RAM. Exceeding it does not fail outright; llama.cpp falls
+# back to CPU, which is the difference between "slow" and "impossible", so it
+# gets its own verdict rather than being lumped in with "won't run".
+HW_CHIP=""
+HW_RAM_GB=0
+HW_BUDGET_GB=0
+HW_BANDWIDTH=0          # GB/s; 0 means unknown, and the speed column stays "-"
+HW_KIND=""
+
+# Peak memory bandwidth per chip (GB/s). Decode streams the weights once per
+# token, so this is the number that sets tokens/sec.
+bandwidth_for_chip() {
+    case "$1" in
+        *"M1 Ultra"*) echo 800 ;; *"M1 Max"*) echo 400 ;; *"M1 Pro"*) echo 200 ;; *"M1"*) echo 68 ;;
+        *"M2 Ultra"*) echo 800 ;; *"M2 Max"*) echo 400 ;; *"M2 Pro"*) echo 200 ;; *"M2"*) echo 100 ;;
+        *"M3 Ultra"*) echo 800 ;; *"M3 Max"*) echo 400 ;; *"M3 Pro"*) echo 150 ;; *"M3"*) echo 100 ;;
+        *"M4 Max"*)   echo 546 ;; *"M4 Pro"*) echo 273 ;; *"M4"*) echo 120 ;;
+        *"M5 Max"*)   echo 546 ;; *"M5 Pro"*) echo 273 ;; *"M5"*) echo 153 ;;
+        *5090*) echo 1792 ;; *4090*) echo 1008 ;; *3090*) echo 936 ;;
+        *4080*) echo 717  ;; *4070*) echo 504  ;; *A100*) echo 1555 ;;
+        *) echo 0 ;;
+    esac
+}
+
+detect_hardware() {
+    local os
+    os=$(uname -s 2>/dev/null || echo unknown)
+
+    if [ "$os" = "Darwin" ]; then
+        local memb wired
+        memb=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+        case "$memb" in ''|*[!0-9]*) memb=0 ;; esac
+        HW_RAM_GB=$(( memb / 1073741824 ))
+
+        HW_CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "")
+        if [ -z "$HW_CHIP" ]; then
+            HW_CHIP=$(sysctl -n hw.model 2>/dev/null || echo "unknown")
+        fi
+
+        # 0 means "no override set", i.e. the system default policy, which is
+        # roughly 75% of unified memory.
+        wired=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+        case "$wired" in ''|*[!0-9]*) wired=0 ;; esac
+        if [ "$wired" -gt 0 ]; then
+            HW_BUDGET_GB=$(( wired / 1024 ))
+        else
+            HW_BUDGET_GB=$(( HW_RAM_GB * 3 / 4 ))
+        fi
+
+        case "$HW_CHIP" in
+            *Apple*) HW_KIND="unified memory" ;;
+            *)       HW_KIND="Intel Mac" ;;
+        esac
+
+    elif [ "$os" = "Linux" ]; then
+        local kb vram gpuname
+        kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+        case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+        HW_RAM_GB=$(( kb / 1048576 ))
+        HW_CHIP=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "unknown")
+
+        vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)
+        case "$vram" in ''|*[!0-9]*) vram=0 ;; esac
+        if [ "$vram" -gt 0 ]; then
+            gpuname=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
+            if [ -n "$gpuname" ]; then HW_CHIP="$gpuname"; fi
+            HW_BUDGET_GB=$(( vram / 1024 ))
+            HW_KIND="dedicated VRAM"
+        else
+            HW_BUDGET_GB=$(( HW_RAM_GB * 3 / 4 ))
+            HW_KIND="CPU only"
+        fi
+    else
+        HW_CHIP="unknown"
+        HW_KIND="unknown"
+    fi
+
+    if [ "$HW_BUDGET_GB" -lt 1 ]; then HW_BUDGET_GB=1; fi
+    HW_BANDWIDTH=$(bandwidth_for_chip "$HW_CHIP")
+    return 0
+}
+
+# Compact size for a narrow column: "10.8GB", "180MB". format_size_gb() renders
+# "10.8 GB" with a space, which is right for the variant table but too wide here.
+format_size_compact() {
+    local bytes="$1"
+    case "$bytes" in ''|*[!0-9]*) printf '%s' "-"; return 0 ;; esac
+    awk -v b="$bytes" 'BEGIN {
+        if (b >= 1073741824) { g = b / 1073741824
+            if (g >= 100) printf "%dGB", int(g + 0.5); else printf "%.1fGB", int(g * 10 + 0.5) / 10
+        } else printf "%dMB", int(b / 1048576 + 0.5)
+    }'
+}
+
+# Weights are not the only resident cost - KV cache and runtime overhead scale
+# with the model - so demand ~15% headroom plus 1GB before calling it a fit.
+#
+# Rank: 0 comfortable, 1 tight, 2 CPU fallback, 3 won't run, 9 unknown. This is
+# a pure function rather than a global side effect because every caller invokes
+# it as $(...), and a subshell assignment would never reach the caller.
+verdict_rank_for() {
+    local bytes="$1" need_gb
+    case "$bytes" in ''|-|*[!0-9]*) printf '9'; return 0 ;; esac
+
+    need_gb=$(( (bytes / 1073741824) * 115 / 100 + 1 ))
+    if [ "$need_gb" -lt 1 ]; then need_gb=1; fi
+
+    if   [ $(( need_gb * 10 )) -le $(( HW_BUDGET_GB * 6 )) ]; then printf '0'
+    elif [ "$need_gb" -le "$HW_BUDGET_GB" ];                  then printf '1'
+    elif [ "$need_gb" -le "$HW_RAM_GB" ];                     then printf '2'
+    else                                                           printf '3'
+    fi
+    return 0
+}
+
+# bash printf pads %-Ns by BYTES, not characters or display cells, and these
+# markers are not all the same byte length (U+2705 and U+274C are 3 bytes,
+# U+1F7E1 and U+1F7E0 are 4). Letting printf pad a cell containing one shifts
+# the column by a byte on half the rows - verified, it really does. So build the
+# cell at a fixed display width here: one 2-cell marker, a space, then the size
+# padded as pure ASCII where bytes and characters agree. Callers emit it with a
+# bare %s and must not apply a field width.
+FIT_CELL_W=7
+verdict_for() {
+    local bytes="$1" rank marker text
+    rank=$(verdict_rank_for "$bytes")
+    case "$rank" in
+        0) marker='✅'; text=$(format_size_compact "$bytes") ;;
+        1) marker='🟡'; text=$(format_size_compact "$bytes") ;;
+        2) marker='🟠'; text=$(format_size_compact "$bytes") ;;
+        3) marker='❌'; text=$(format_size_compact "$bytes") ;;
+        *) marker='  '; text="-" ;;   # two spaces occupy the same 2 cells
+    esac
+    printf '%s %-*s' "$marker" "$FIT_CELL_W" "$text"
+    return 0
+}
+
+# Decode is bandwidth bound, so tok/s tracks bandwidth over resident bytes. The
+# efficiency factors are empirical, calibrated against qwen3:8b-q4_K_M running
+# ~38 tok/s on an M4 Pro. MoE models stream only their active experts, so they
+# run far faster than their total size implies, at some routing cost.
+#
+# Below roughly a gigabyte the model stops being bandwidth bound - sampling and
+# kernel-launch overhead dominate - and the formula runs away (it claims 480
+# tok/s for a 378MB model). Cap the reported figure rather than print a number
+# that will not survive contact with reality. These are estimates throughout,
+# and the UI says so.
+TOK_S_CAP=200
+estimate_tok_s() {
+    local bytes="$1" active_pct="${2:-100}" eff=65 active_mb ts
+    case "$bytes" in ''|-|*[!0-9]*) printf '%s' "-"; return 0 ;; esac
+    case "$active_pct" in ''|*[!0-9]*) active_pct=100 ;; esac
+    if [ "$HW_BANDWIDTH" -le 0 ]; then printf '%s' "-"; return 0; fi
+
+    # Only quote a speed for models that actually run on the accelerator. A
+    # model that will not load has no decode rate, and printing a fast-looking
+    # number beside a "won't run" verdict reads as a recommendation. Past the
+    # GPU budget the work moves to the CPU, where this bandwidth model no longer
+    # describes what happens - so say nothing rather than something wrong.
+    case "$(verdict_rank_for "$bytes")" in
+        0|1) : ;;
+        *)   printf '%s' "-"; return 0 ;;
+    esac
+
+    if [ "$active_pct" -lt 100 ]; then eff=50; fi
+    active_mb=$(( (bytes / 1048576) * active_pct / 100 ))
+    if [ "$active_mb" -le 0 ]; then printf '%s' "-"; return 0; fi
+
+    ts=$(( HW_BANDWIDTH * 1024 * eff / 100 / active_mb ))
+    if   [ "$ts" -le 0 ];            then printf '%s' "<1"
+    elif [ "$ts" -gt "$TOK_S_CAP" ]; then printf '%s+' "$TOK_S_CAP"
+    else                                  printf '%s' "$ts"
+    fi
+    return 0
+}
+
+# --- Parameter ranges ------------------------------------------------------
+#
+# Docker AI models encode their parameter size in the tag name ("20b", "120b",
+# "270m", "1.7b", "1t"), so the min/max across a repo's tags gives the range of
+# sizes it ships - the number that decides whether a model fits a given machine.
+#
+# There is no bulk endpoint for this, so it costs one tags request per model.
+# Results are cached on disk because that is otherwise ~8s added to every start.
+#
+# Note: some repos do not encode a size in any tag (their tags are just
+# "latest", "safetensors", "q8_0", ...). The registry config blob does not carry
+# a parameter count either, so those are genuinely unknowable from the API and
+# are shown as "-".
+PARAM_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/docker_model_downloader"
+PARAM_CACHE_FILE="$PARAM_CACHE_DIR/param-ranges-v3.tsv"
+PARAM_CACHE_TTL=$(( 7 * 24 * 3600 ))
+PARAM_FETCH_JOBS=12
+PARAM_MAP=""
+
+# Cache records are 5 tab-separated fields:
+#   name <TAB> param_range <TAB> smallest_gguf_bytes <TAB> smallest_gguf_tag
+#        <TAB> active_param_percent
+#
+# The size fields come free: the same tags response that carries the tag names
+# also carries full_size per tag, so knowing what actually fits on this machine
+# costs no extra requests. (v1 caches held 2 fields; the filename bump above
+# retires them rather than mis-parsing them.)
+
+# Look up one field of a name's record in the TSV held in PARAM_MAP. The
+# "\n<name>\t" delimiters make this unambiguous for names that prefix one
+# another (qwen3 vs qwen3-coder).
+lookup_param_field() {
+    local name="$1" field="$2" rest row
+    case "$PARAM_MAP" in
+        *$'\n'"$name"$'\t'*)
+            rest="${PARAM_MAP#*$'\n'"$name"$'\t'}"
+            row="${rest%%$'\n'*}"
+            printf '%s' "$row" | cut -f "$field"
+            ;;
+        *)
+            printf '%s' "-"
+            ;;
+    esac
+    return 0
+}
+
+fetch_param_ranges() {
+    model_params=()
+    model_minbytes=()
+    model_mintag=()
+    model_active=()
+
+    local now cache_age=0
+    now=$(date +%s)
+
+    mkdir -p "$PARAM_CACHE_DIR" 2>/dev/null || true
+
+    # Load a non-expired cache.
+    PARAM_MAP=$'\n'
+    if [ -f "$PARAM_CACHE_FILE" ]; then
+        local stamp
+        stamp=$(head -1 "$PARAM_CACHE_FILE" 2>/dev/null || echo 0)
+        case "$stamp" in
+            ''|*[!0-9]*) stamp=0 ;;
+        esac
+        cache_age=$(( now - stamp ))
+        if [ "$cache_age" -lt "$PARAM_CACHE_TTL" ]; then
+            PARAM_MAP=$'\n'$(tail -n +2 "$PARAM_CACHE_FILE" 2>/dev/null || true)$'\n'
+        fi
+    fi
+
+    # Only fetch what the cache is missing, so new models cost one request.
+    local missing_file
+    missing_file=$(mktemp)
+    local i
+    for (( i=0; i<total_models; i++ )); do
+        local n="${model_names[$i]}"
+        case "$PARAM_MAP" in
+            *$'\n'"$n"$'\t'*) : ;;
+            *) printf '%s\n' "$n" >> "$missing_file" ;;
+        esac
+    done
+
+    local missing_count
+    missing_count=$(wc -l < "$missing_file" | tr -d ' ')
+
+    if [ "$missing_count" -gt 0 ]; then
+        start_spinner "Reading parameter sizes for $missing_count model(s)..."
+
+        local worker out_dir
+        worker=$(mktemp)
+        out_dir=$(mktemp -d)
+
+        cat > "$worker" <<'WORKER'
+#!/bin/bash
+name="$1"
+out="$2/$1"
+tags=$(curl -fsSL "https://hub.docker.com/v2/repositories/ai/${name}/tags?page_size=100" -H 'accept: */*' 2>/dev/null | jq -r '.results[] | "\(.name)\t\(.full_size // 0)"' 2>/dev/null || true)
+[ -z "$tags" ] && { printf '%s\t-\t-\t-\t-\n' "$name" > "$out"; exit 0; }
+
+# Parameter range, parsed from the tag names.
+range=$(printf '%s\n' "$tags" | awk -F'\t' '
+function fmt(v,   s) {
+    if (v >= 1000000) { s = sprintf("%.1f", v / 1000000); sub(/\.0$/, "", s); return s "T" }
+    if (v >= 1000)    { s = sprintf("%.1f", v / 1000);    sub(/\.0$/, "", s); return s "B" }
+    return sprintf("%dM", v)
+}
+{
+    tag = tolower($1)
+    if (match(tag, /^[0-9]+(\.[0-9]+)?[bmt]/)) {
+        tok = substr(tag, 1, RLENGTH)
+        nxt = substr(tag, RLENGTH + 1, 1)
+        # Require a separator so "4bit" (a quantisation) is not read as "4B".
+        if (nxt == "" || nxt == "-" || nxt == "_") {
+            unit = substr(tok, length(tok), 1)
+            num  = substr(tok, 1, length(tok) - 1) + 0
+            v = (unit == "t") ? num * 1000000 : (unit == "b") ? num * 1000 : num
+            if (!seen || v < mn) mn = v
+            if (!seen || v > mx) mx = v
+            seen = 1
+        }
+    }
+}
+END { print !seen ? "-" : ((mn == mx) ? fmt(mn) : fmt(mn) " - " fmt(mx)) }')
+
+# Candidate weight files, smallest first. safetensors and mlx builds are a
+# different format the GGUF runtime never loads (gpt-oss 20b-safetensors is
+# 38GB against 10.8GB for 20b-q4_K_M), and mtp/draft/lora tags are auxiliary
+# modules rather than servable models.
+cands=$(printf '%s\n' "$tags" | awk -F'\t' '
+    { tag = tolower($1); size = $2 + 0
+      if (size <= 0) next
+      if (tag ~ /safetensors|mlx|mmproj|mtp|draft|lora|adapter/) next
+      print size "\t" $1 }' | sort -n | head -12)
+
+# A tag name alone cannot be trusted to describe its contents: ai/gemma4:12b-q8_0
+# is 611MB because it ships mtp-gemma-4-12b-it-Q8_0.gguf (a multi-token-prediction
+# head) plus an mmproj projector, not the 12B weights. Reporting that as the
+# model size yields a falsely optimistic "fits comfortably" verdict, which is the
+# exact failure this column exists to prevent. So confirm against the manifest,
+# whose layers carry an org.cncf.model.filepath annotation, and take the smallest
+# tag that actually holds primary weights.
+gmin="-"; gtag="-"
+# A "-safetensors" repo says up front that it ships no GGUF, so skip the manifest
+# probing entirely rather than spending a dozen requests to conclude the same.
+case "$name" in
+    *-safetensors) cands="" ;;
+esac
+token=""
+if [ -n "$cands" ]; then
+    token=$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ai/${name}:pull" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || true)
+fi
+if [ -n "$token" ] && [ -n "$cands" ]; then
+    while IFS='	' read -r csize ctag; do
+        [ -n "$ctag" ] || continue
+        files=$(curl -fsSL "https://registry-1.docker.io/v2/ai/${name}/manifests/${ctag}" \
+            -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.cncf.model.manifest.v1+json' \
+            2>/dev/null | jq -r '.layers[]? | .annotations["org.cncf.model.filepath"] // empty' 2>/dev/null || true)
+        # No annotations at all means we cannot disprove it, so accept rather
+        # than discard a usable model on missing metadata.
+        state=$(printf '%s\n' "$files" | awk '
+            { f = tolower($0); if (f == "") next; n++
+              if (f ~ /\.gguf$/ && f !~ /mtp|mmproj|draft|lora|adapter/) good++ }
+            END { print (n == 0) ? "unknown" : ((good > 0) ? "ok" : "aux") }')
+        if [ "$state" != "aux" ]; then gmin="$csize"; gtag="$ctag"; break; fi
+    done < <(printf '%s\n' "$cands")
+elif [ -n "$cands" ]; then
+    # Registry unreachable: fall back to the name-filtered smallest rather than
+    # dropping the size entirely.
+    gmin=$(printf '%s\n' "$cands" | head -1 | cut -f1)
+    gtag=$(printf '%s\n' "$cands" | head -1 | cut -f2)
+fi
+
+# Mixture-of-experts models only read a fraction of their weights per token, so
+# decode speed tracks the active parameters, not the file size. Docker tags spell
+# this out directly - "26b-a4b" is 26B total / 4B active, "2.4t-a95b" is 2.4T/95B -
+# which is both free and authoritative, so prefer it over any external source.
+active="-"
+if [ "$gtag" != "-" ]; then
+    # The chosen tag is often a bare alias ("30B") whose sibling spells the split
+    # out ("30b-a3b"), so match on the leading parameter token rather than the
+    # exact tag.
+    active=$(printf '%s\n' "$tags" | awk -F'\t' -v gtag="$gtag" '
+    BEGIN {
+        g = tolower(gtag)
+        gp = match(g, /^[0-9]+(\.[0-9]+)?[bt]/) ? substr(g, 1, RLENGTH) : ""
+        if (gp != "") {
+            unit  = substr(gp, length(gp), 1)
+            num   = substr(gp, 1, length(gp) - 1) + 0
+            total = (unit == "t") ? num * 1000 : num
+        }
+    }
+    gp == "" || total <= 0 { exit }
+    substr(tolower($1), 1, length(gp)) != gp { next }
+    {
+        t = tolower($1)
+        if (t ~ /^[0-9]+(\.[0-9]+)?[bt]-a[0-9]+(\.[0-9]+)?b/ && match(t, /-a[0-9]+(\.[0-9]+)?b/)) {
+            a = substr(t, RSTART + 2, RLENGTH - 3) + 0
+            p = int(a * 100 / total + 0.5)
+            if (p < 1)   p = 1
+            if (p > 100) p = 100
+            print p
+            found = 1
+            exit
+        }
+    }
+    END { if (!found) print "-" }')
+    [ -n "$active" ] || active="-"
+fi
+
+printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$range" "$gmin" "$gtag" "$active" > "$out"
+WORKER
+        chmod +x "$worker"
+
+        xargs -P "$PARAM_FETCH_JOBS" -I{} "$worker" {} "$out_dir" < "$missing_file" 2>/dev/null || true
+
+        # Merge freshly fetched entries into the map.
+        local merged
+        merged=$(cat "$out_dir"/* 2>/dev/null || true)
+        if [ -n "$merged" ]; then
+            PARAM_MAP="${PARAM_MAP}${merged}"$'\n'
+        fi
+
+        # Rewrite the cache: timestamp line, then every known entry.
+        {
+            printf '%s\n' "$now"
+            printf '%s' "$PARAM_MAP" | grep -v '^$' || true
+        } > "$PARAM_CACHE_FILE" 2>/dev/null || true
+
+        rm -rf "$out_dir" "$worker" 2>/dev/null || true
+        stop_spinner
+    fi
+
+    rm -f "$missing_file" 2>/dev/null || true
+
+    for (( i=0; i<total_models; i++ )); do
+        local rec
+        rec=$(lookup_param_field "${model_names[$i]}" 1)
+        model_params+=("$rec")
+        model_minbytes+=("$(lookup_param_field "${model_names[$i]}" 2)")
+        model_mintag+=("$(lookup_param_field "${model_names[$i]}" 3)")
+        model_active+=("$(lookup_param_field "${model_names[$i]}" 4)")
+    done
+
+    fill_gaps_from_models_dev "$total_models" || true
+
+    return 0
+}
+
+MODELSDEV_CACHE_FILE=""
+MODELSDEV_URL="https://models.dev/api.json"
+
+# Docker Hub leaves a lot blank: 46 of 103 ai/* repos publish no description, and
+# tag names do not always encode a parameter count. models.dev catalogues the same
+# models and can close those gaps.
+#
+# This only ever writes into cells Docker left empty. A value Docker supplied is
+# authoritative - it describes the artifact actually being downloaded - so it is
+# never overwritten, even when models.dev disagrees.
+fill_gaps_from_models_dev() {
+    local total_models="$1"
+    local i needed=0
+
+    for (( i=0; i<total_models; i++ )); do
+        if [ "${model_params[$i]:--}" = "-" ] || [ -z "${model_descriptions[$i]}" ]; then
+            needed=1
+            break
+        fi
+    done
+    [ "$needed" -eq 1 ] || return 0
+
+    MODELSDEV_CACHE_FILE="$PARAM_CACHE_DIR/models-dev.json"
+    local now stamp=0 age=0
+    now=$(date +%s)
+    if [ -f "$MODELSDEV_CACHE_FILE" ]; then
+        stamp=$(stat -f %m "$MODELSDEV_CACHE_FILE" 2>/dev/null || stat -c %Y "$MODELSDEV_CACHE_FILE" 2>/dev/null || echo 0)
+        case "$stamp" in ''|*[!0-9]*) stamp=0 ;; esac
+        age=$(( now - stamp ))
+    fi
+    if [ ! -s "$MODELSDEV_CACHE_FILE" ] || [ "$age" -ge "$PARAM_CACHE_TTL" ]; then
+        start_spinner "Filling gaps from models.dev..."
+        curl -fsSL --max-time 25 "$MODELSDEV_URL" -o "$MODELSDEV_CACHE_FILE.tmp" 2>/dev/null \
+            && mv -f "$MODELSDEV_CACHE_FILE.tmp" "$MODELSDEV_CACHE_FILE" 2>/dev/null || true
+        rm -f "$MODELSDEV_CACHE_FILE.tmp" 2>/dev/null || true
+        stop_spinner
+    fi
+    [ -s "$MODELSDEV_CACHE_FILE" ] || return 0
+
+    # Flatten to "display name <TAB> description" pairs.
+    local pairs
+    pairs=$(jq -r '.. | objects | select(has("name")) | "\(.name)\t\(.description // "")"' \
+        "$MODELSDEV_CACHE_FILE" 2>/dev/null | grep -v '^\s*$' || true)
+    [ -n "$pairs" ] || return 0
+
+    local names_file resolved
+    names_file=$(mktemp)
+    for (( i=0; i<total_models; i++ )); do
+        printf '%s\n' "${model_names[$i]}"
+    done > "$names_file"
+
+    resolved=$(printf '%s\n' "$pairs" | awk -F'\t' '
+function norm(s) { s = tolower(s); gsub(/[^a-z0-9.]+/, "-", s); gsub(/^-+|-+$/, "", s); return s }
+function fmt(v,   s) {
+    if (v >= 1000000) { s = sprintf("%.1f", v/1000000); sub(/\.0$/,"",s); return s "T" }
+    if (v >= 1000)    { s = sprintf("%.1f", v/1000);    sub(/\.0$/,"",s); return s "B" }
+    return sprintf("%dM", v)
+}
+function scale(tok,   n, v) { n = tok; gsub(/[^0-9.]/, "", n); v = n + 0
+    if (tok ~ /[tT]/) return v * 1000000
+    if (tok ~ /[mM]/) return v
+    return v * 1000 }
+function note(k, v) { if (!(k in mn) || v < mn[k]) mn[k] = v; if (!(k in mx) || v > mx[k]) mx[k] = v }
+NR == FNR { dock[FNR] = $0; nd = FNR; next }
+{
+    nm = norm($1)
+    for (k = 1; k <= nd; k++) {
+        d = norm(dock[k])
+        exact = (nm == d)
+        # Family prefix: "qwen3" may answer for "qwen3-coder", but never the reverse.
+        if (!exact && index(nm, d "-") != 1) continue
+        # Parameter counts live in the display name. Skip MoE active counts,
+        # written "A55B", so "550B A55B" reports 550B rather than 55B.
+        s = $1
+        while (match(s, /[0-9]+(\.[0-9]+)?[bBtT]([^a-zA-Z0-9]|$)/)) {
+            tok = substr(s, RSTART, RLENGTH)
+            pre = (RSTART > 1) ? substr(s, RSTART - 1, 1) : " "
+            if (pre != "a" && pre != "A") note(k, scale(tok))
+            s = substr(s, RSTART + RLENGTH)
+        }
+        if (exact) { if (!(k in dex)) { dex[k] = 1; desc[k] = $2 } }
+        else if (!(k in dex) && length($2) > length(desc[k])) desc[k] = $2
+    }
+}
+END {
+    for (k = 1; k <= nd; k++) {
+        # Last resort: mine "1.6T-parameter" / "2.8T parameter" out of the prose.
+        if (!(k in mn)) {
+            s = desc[k]
+            while (match(s, /[0-9]+(\.[0-9]+)?[ ]?[BTM][- ]parameter/)) {
+                note(k, scale(substr(s, RSTART, RLENGTH)))
+                s = substr(s, RSTART + RLENGTH)
+            }
+        }
+        printf "%s\t%s\t%s\n", dock[k], \
+            (k in mn) ? ((mn[k] == mx[k]) ? fmt(mn[k]) : fmt(mn[k]) " - " fmt(mx[k])) : "-", \
+            desc[k]
+    }
+}' "$names_file" - 2>/dev/null || true)
+    rm -f "$names_file" 2>/dev/null || true
+    [ -n "$resolved" ] || return 0
+
+    local line mdname mdparams mddesc
+    i=0
+    while IFS=$'\t' read -r mdname mdparams mddesc; do
+        [ "$i" -lt "$total_models" ] || break
+        if [ "${model_params[$i]:--}" = "-" ] && [ -n "$mdparams" ] && [ "$mdparams" != "-" ]; then
+            model_params[$i]="$mdparams"
+        fi
+        if [ -z "${model_descriptions[$i]}" ] && [ -n "$mddesc" ]; then
+            model_descriptions[$i]="$mddesc"
+        fi
+        i=$(( i + 1 ))
+    done <<EOF
+$resolved
+EOF
+
+    return 0
+}
+
 fetch_variants_for_model() {
     local model="$1"
     local repo="ai/$model"
@@ -969,50 +1521,402 @@ fetch_models_from_dockerhub
 # Pagination settings
 MODELS_PER_PAGE=20
 total_models=${#model_names[@]}
-total_pages=$(( (total_models + MODELS_PER_PAGE - 1) / MODELS_PER_PAGE ))
 current_page=1
 
+detect_hardware
+fetch_param_ranges
+
+# Search / filter state.
+#   view_idx     - indices into model_names that are currently listed
+#   search_query - active filter ("" means show everything)
+#   search_active- 1 while the live search bar is on screen
+#   fit_only     - 1 while the list is restricted to what this machine can run
+search_query=""
+search_active=0
+fit_only=0
+view_idx=()
+view_count=0
+
+# Rebuild view_idx from search_query.
+#
+# The query is an unanchored, case-insensitive extended regular expression, so a
+# match anywhere in the name counts ("oder" finds "qwen3-coder", "qwen.*3\.5"
+# works too). While the user is mid-keystroke the query can be a syntactically
+# invalid regex (a lone "[", say); rather than error out we fall back to a
+# literal substring match so the list keeps updating as they type.
+apply_filter() {
+    view_idx=()
+    local i use_regex=1 rc=0 keep
+
+    if [ -n "$search_query" ]; then
+        [[ "x" =~ $search_query ]] 2>/dev/null || rc=$?
+        if [ "$rc" -gt 1 ]; then
+            use_regex=0
+        fi
+    fi
+
+    shopt -s nocasematch
+    for (( i=0; i<total_models; i++ )); do
+        keep=1
+
+        if [ -n "$search_query" ]; then
+            if [ "$use_regex" -eq 1 ]; then
+                if [[ "${model_names[$i]}" =~ $search_query ]]; then :; else keep=0; fi
+            else
+                case "${model_names[$i]}" in
+                    *"$search_query"*) : ;;
+                    *) keep=0 ;;
+                esac
+            fi
+        fi
+
+        # "Runs here" means it fits the accelerator budget: rank 0 or 1. Rank 2
+        # is a CPU fallback and rank 3 does not fit at all. Rank 9 (no size
+        # known) is also excluded - listing an unmeasured model as a fit would
+        # be a guess, and the whole point of this filter is not guessing.
+        if [ "$keep" -eq 1 ] && [ "$fit_only" -eq 1 ]; then
+            case "$(verdict_rank_for "${model_minbytes[$i]:--}")" in
+                0|1) : ;;
+                *)   keep=0 ;;
+            esac
+        fi
+
+        if [ "$keep" -eq 1 ]; then
+            view_idx+=("$i")
+        fi
+    done
+    shopt -u nocasematch
+
+    view_count=${#view_idx[@]}
+    total_pages=$(( (view_count + MODELS_PER_PAGE - 1) / MODELS_PER_PAGE ))
+    if [ "$total_pages" -lt 1 ]; then
+        total_pages=1
+    fi
+    if [ "$current_page" -gt "$total_pages" ]; then
+        current_page=$total_pages
+    fi
+    if [ "$current_page" -lt 1 ]; then
+        current_page=1
+    fi
+    return 0
+}
+
+apply_filter
+
 # Function to display models for current page
-display_page() {
+# The table now carries Fit and tok/s, which cost horizontal space, so the
+# remaining columns are sized against the real terminal width rather than a
+# fixed 80. Description is the elastic one: it takes whatever is left and is
+# dropped entirely when there is not enough room to be worth printing. Stars
+# was removed to fund this - 36 of 100 ai/* repos have zero stars and 61 have
+# two or fewer, so it carried almost no signal.
+LAY_COLS=80
+LAY_NAME_W=22
+LAY_PULLS_W=9
+LAY_DESC_W=0
+LAY_SEP=""
+compute_layout() {
+    local cols fixed
+    cols=$(tput cols 2>/dev/null || echo 80)
+    case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
+    if [ "$cols" -lt 60 ]; then cols=60; fi
+    LAY_COLS=$cols
+
+    if [ "$cols" -ge 120 ]; then
+        LAY_NAME_W=24; LAY_PULLS_W=10
+    else
+        LAY_NAME_W=22; LAY_PULLS_W=9
+    fi
+
+    # num(4) name params(13) fit(10) tok/s(6) pulls, each followed by a space,
+    # plus one extra space before the description.
+    fixed=$(( 4 + 1 + LAY_NAME_W + 1 + 13 + 1 + 10 + 1 + 6 + 1 + LAY_PULLS_W + 2 ))
+    LAY_DESC_W=$(( cols - fixed ))
+    if [ "$LAY_DESC_W" -lt 12 ]; then LAY_DESC_W=0; fi
+
+    LAY_SEP=$(printf '%*s' "$cols" '' | sed 's/ /━/g')
+    return 0
+}
+
+# Full-screen summary of what the fit verdicts are actually based on, so the
+# numbers in the table are auditable rather than magic. Behind a keypress
+# because system_profiler costs about a second and is not worth paying for on
+# every redraw.
+show_hardware_panel() {
+    compute_layout
     clear
     print_banner
     echo
-    print_message "$GREEN" "📋 Available Docker AI Models (Page $current_page of $total_pages):"
+    print_message "$GREEN" "🖥  Detected hardware"
     echo
+    printf "   %-24s %s\n" "Chip" "${HW_CHIP:-unknown}"
+    printf "   %-24s %s GB\n" "Total memory" "$HW_RAM_GB"
+    printf "   %-24s %s GB  (%s)\n" "Budget for weights" "$HW_BUDGET_GB" "$HW_KIND"
+    if [ "$HW_BANDWIDTH" -gt 0 ]; then
+        printf "   %-24s %s GB/s\n" "Memory bandwidth" "$HW_BANDWIDTH"
+    else
+        printf "   %-24s %s\n" "Memory bandwidth" "unknown (speed column shows -)"
+    fi
+
+    local gpucores
+    gpucores=$(system_profiler SPDisplaysDataType 2>/dev/null \
+        | awk -F': ' '/Total Number of Cores/{gsub(/^ +/, "", $2); print $2; exit}' || true)
+    if [ -n "$gpucores" ]; then
+        printf "   %-24s %s\n" "GPU cores" "$gpucores"
+    fi
+
+    echo
+    print_message "$GREEN" "What the Fit column means"
+    echo
+    printf "   %s  %s\n" "✅" "fits comfortably - under 60% of the budget"
+    printf "   %s  %s\n" "🟡" "fits, but with little headroom for a long context"
+    printf "   %s  %s\n" "🟠" "over the accelerator budget; runs on CPU instead, slowly"
+    printf "   %s  %s\n" "❌" "larger than total memory - will not run"
+    printf "   %s  %s\n" " -" "no GGUF build published, so no verdict"
+    echo
+    print_message "$YELLOW" "The size shown is the smallest GGUF build the repo ships, so it is the"
+    print_message "$YELLOW" "best case; larger quantisations of the same model will need more."
+    echo
+    print_message "$YELLOW" "tok/s figures are ESTIMATES, not measurements. They assume decode is"
+    print_message "$YELLOW" "memory-bandwidth bound and are capped at ${TOK_S_CAP}. Treat them as a rough"
+    print_message "$YELLOW" "guide to whether a model will feel usable, not as a benchmark."
+    echo
+    print_message "$YELLOW" "A speed is shown only for models that fit the accelerator budget."
+    print_message "$YELLOW" "Past it the work moves to the CPU, which this model does not describe."
+    echo
+    print_message "$YELLOW" "$LAY_SEP"
+    print_message "$YELLOW" "Press any key to return"
+    read_key >/dev/null 2>&1 || true
+    return 0
+}
+
+display_page() {
+    compute_layout
+    clear
+    print_banner
+    echo
+
+    local filter_desc=""
+    if [ -n "$search_query" ] && [ "$fit_only" -eq 1 ]; then
+        filter_desc="matching \"$search_query\" and runnable here"
+    elif [ -n "$search_query" ]; then
+        filter_desc="matching \"$search_query\""
+    elif [ "$fit_only" -eq 1 ]; then
+        filter_desc="that run on this machine"
+    fi
+
+    if [ -n "$filter_desc" ]; then
+        print_message "$GREEN" "📋 Docker AI Models — $filter_desc: $view_count of $total_models (Page $current_page of $total_pages):"
+    else
+        print_message "$GREEN" "📋 Available Docker AI Models (Page $current_page of $total_pages):"
+    fi
+    echo
+
+    if [ "$search_active" -eq 1 ]; then
+        print_message "$CYAN" "🔎 Search: ${search_query}▌"
+    fi
+
+    local sep="$LAY_SEP"
+
+    if [ "$view_count" -eq 0 ]; then
+        echo
+        if [ -n "$search_query" ]; then
+            print_message "$YELLOW" "No models match \"$search_query\" — press [⌫] to widen the search."
+        else
+            print_message "$YELLOW" "Nothing here fits this machine's ${HW_BUDGET_GB}GB budget — press [r] to show everything."
+        fi
+        echo
+        print_message "$YELLOW" "$sep"
+        if [ "$search_active" -eq 1 ]; then
+            print_message "$YELLOW" "Type to filter  [⌫] Delete  [Esc] Cancel search  [Enter] Keep filter"
+        else
+            print_message "$YELLOW" "Navigation: [f] Search  [r] Fits only  [h] Hardware  [c] Clear  [q] Quit"
+        fi
+        print_message "$YELLOW" "$sep"
+        return
+    fi
 
     local start_idx=$(( (current_page - 1) * MODELS_PER_PAGE ))
     local end_idx=$(( start_idx + MODELS_PER_PAGE ))
 
-    if [ $end_idx -gt $total_models ]; then
-        end_idx=$total_models
+    if [ $end_idx -gt $view_count ]; then
+        end_idx=$view_count
     fi
 
-    # Display header
+    # Display header. The Fit cell is pre-padded to a fixed display width by
+    # verdict_for(), so it is printed with a bare %s - giving printf a field
+    # width would pad by bytes and shift the column on rows whose marker is a
+    # 4-byte emoji.
+    local dash_name dash_pulls dash_desc
+    dash_name=$(printf '%*s' "$LAY_NAME_W" '' | tr ' ' '-')
+    dash_pulls=$(printf '%*s' "$LAY_PULLS_W" '' | tr ' ' '-')
     printf "\n"
-    printf "%-4s %-27s %6s %10s   %s\n" "#" "Model Name" "Stars" "Pulls" "Description"
-    printf "%-4s %-27s %6s %10s   %s\n" "----" "---------------------------" "------" "----------" "-----------------------------------------"
+    if [ "$LAY_DESC_W" -gt 0 ]; then
+        dash_desc=$(printf '%*s' "$LAY_DESC_W" '' | tr ' ' '-')
+        printf "%-4s %-*s %-13s %-10s %6s %*s  %s\n" \
+            "#" "$LAY_NAME_W" "Model Name" "Parameters" "Fit" "tok/s" "$LAY_PULLS_W" "Pulls" "Description"
+        printf "%-4s %-*s %-13s %-10s %6s %*s  %s\n" \
+            "----" "$LAY_NAME_W" "$dash_name" "-------------" "----------" "------" "$LAY_PULLS_W" "$dash_pulls" "$dash_desc"
+    else
+        printf "%-4s %-*s %-13s %-10s %6s %*s\n" \
+            "#" "$LAY_NAME_W" "Model Name" "Parameters" "Fit" "tok/s" "$LAY_PULLS_W" "Pulls"
+        printf "%-4s %-*s %-13s %-10s %6s %*s\n" \
+            "----" "$LAY_NAME_W" "$dash_name" "-------------" "----------" "------" "$LAY_PULLS_W" "$dash_pulls"
+    fi
 
-    # Display models
-    for (( i=start_idx; i<end_idx; i++ )); do
-        local display_num=$((i + 1))
+    # Display models. v walks the filtered view; i is the real model_names index.
+    local v i
+    for (( v=start_idx; v<end_idx; v++ )); do
+        i=${view_idx[$v]}
+        local display_num=$((v + 1))
         # Format pulls with comma separators for readability
         local formatted_pulls=$(printf "%'d" "${model_pulls[$i]}" 2>/dev/null || echo "${model_pulls[$i]}")
-        local display_name
-        display_name=$(truncate_text "${model_names[$i]}" 27)
-        printf "%-4s %-27s %6s %10s   %s\n" \
-            "$display_num)" \
-            "$display_name" \
-            "${model_stars[$i]}" \
-            "$formatted_pulls" \
-            "${model_descriptions[$i]}"
+        local display_name fit_cell tok_cell
+        display_name=$(truncate_text "${model_names[$i]}" "$LAY_NAME_W")
+        fit_cell=$(verdict_for "${model_minbytes[$i]:--}")
+        tok_cell=$(estimate_tok_s "${model_minbytes[$i]:--}" "${model_active[$i]:-100}")
+        if [ "$LAY_DESC_W" -gt 0 ]; then
+            printf "%-4s %-*s %-13s %s %6s %*s  %s\n" \
+                "$display_num)" \
+                "$LAY_NAME_W" "$display_name" \
+                "${model_params[$i]:--}" \
+                "$fit_cell" \
+                "$tok_cell" \
+                "$LAY_PULLS_W" "$formatted_pulls" \
+                "$(truncate_text "${model_descriptions[$i]}" "$LAY_DESC_W")"
+        else
+            printf "%-4s %-*s %-13s %s %6s %*s\n" \
+                "$display_num)" \
+                "$LAY_NAME_W" "$display_name" \
+                "${model_params[$i]:--}" \
+                "$fit_cell" \
+                "$tok_cell" \
+                "$LAY_PULLS_W" "$formatted_pulls"
+        fi
     done
 
     echo
-    print_message "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    local start_num=$((start_idx + 1))
-    local end_num=$end_idx
-    print_message "$YELLOW" "Navigation: [←] Previous  [→] Next  [Type number 1-$total_models + Enter] Select  [q] Quit"
-    print_message "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    print_message "$YELLOW" "$sep"
+    if [ "$search_active" -eq 1 ]; then
+        print_message "$YELLOW" "Type to filter  [⌫] Delete  [Esc] Cancel search  [Enter] Keep filter"
+    else
+        local fit_label="Fits only"
+        if [ "$fit_only" -eq 1 ]; then
+            fit_label="Show all"
+        fi
+        if [ -n "$search_query" ] || [ "$fit_only" -eq 1 ]; then
+            print_message "$YELLOW" "Navigation: [←] Prev  [→] Next  [f] Search  [r] $fit_label  [h] Hardware  [c] Clear  [1-$view_count + Enter] Select  [q] Quit"
+        else
+            print_message "$YELLOW" "Navigation: [←] Prev  [→] Next  [f] Search  [r] $fit_label  [h] Hardware  [1-$view_count + Enter] Select  [q] Quit"
+        fi
+    fi
+    print_message "$YELLOW" "$sep"
+}
+
+# --- Live search -----------------------------------------------------------
+#
+# macOS ships bash 3.2, whose `read -t` rejects sub-second timeouts, so we can't
+# use a short read to tell a bare Esc from the start of an arrow-key escape
+# sequence. `read -n` also resets termios itself, which defeats stty. Instead we
+# hold the terminal in non-canonical mode for the whole search session and pull
+# bytes with dd, which honours VMIN/VTIME (VTIME is in tenths of a second).
+search_key_begin() {
+    SEARCH_STTY_SAVED=$(stty -g 2>/dev/null || true)
+    stty -icanon -echo min 1 time 0 2>/dev/null || true
+}
+
+search_key_end() {
+    if [ -n "${SEARCH_STTY_SAVED:-}" ]; then
+        stty "$SEARCH_STTY_SAVED" 2>/dev/null || true
+        SEARCH_STTY_SAVED=""
+    fi
+}
+
+# Non-canonical mode must always be handed back, including on Ctrl-C, or the
+# user is dropped into a shell with no echo.
+trap 'search_key_end' EXIT
+trap 'search_key_end; exit 130' INT
+trap 'search_key_end; exit 143' TERM
+
+search_key_read() {
+    local key rest
+    key=$(dd bs=1 count=1 2>/dev/null)
+
+    if [ "$key" = $'\x1b' ]; then
+        # Wait up to 0.1s for the rest of an escape sequence. Nothing follows a
+        # bare Esc, so the read times out and we report ESC.
+        stty min 0 time 1 2>/dev/null || true
+        rest=$(dd bs=1 count=2 2>/dev/null)
+        stty min 1 time 0 2>/dev/null || true
+        case "$rest" in
+            '[D') echo "LEFT" ;;
+            '[C') echo "RIGHT" ;;
+            '[A') echo "UP" ;;
+            '[B') echo "DOWN" ;;
+            *)    echo "ESC" ;;
+        esac
+        return 0
+    fi
+
+    case "$key" in
+        '')            echo "ENTER" ;;
+        $'\x7f'|$'\b') echo "BACKSPACE" ;;
+        *)             printf 'CHAR:%s\n' "$key" ;;
+    esac
+    return 0
+}
+
+# Live-filter the model list. Esc drops the filter and closes the search bar;
+# Enter closes the bar but keeps the filter so a number can then be selected.
+run_search() {
+    search_active=1
+    search_key_begin
+
+    while true; do
+        display_page
+
+        local key
+        key=$(search_key_read)
+
+        case "$key" in
+            ESC)
+                search_query=""
+                current_page=1
+                apply_filter
+                break
+                ;;
+            ENTER)
+                break
+                ;;
+            BACKSPACE)
+                search_query="${search_query%?}"
+                current_page=1
+                apply_filter
+                ;;
+            LEFT)
+                if [ "$current_page" -gt 1 ]; then
+                    current_page=$((current_page - 1))
+                fi
+                ;;
+            RIGHT)
+                if [ "$current_page" -lt "$total_pages" ]; then
+                    current_page=$((current_page + 1))
+                fi
+                ;;
+            UP|DOWN)
+                : # ignored while searching
+                ;;
+            CHAR:*)
+                search_query="${search_query}${key#CHAR:}"
+                current_page=1
+                apply_filter
+                ;;
+        esac
+    done
+
+    search_key_end
+    search_active=0
+    return 0
 }
 
 # Function to read a single keypress including arrow keys
@@ -1076,6 +1980,35 @@ while true; do
             print_message "$YELLOW" "Exiting..."
             exit 0
             ;;
+        # Live search
+        f|F)
+            run_search
+            ;;
+        # What this machine can run
+        h|H)
+            show_hardware_panel
+            ;;
+        # Restrict the list to models that fit this machine
+        r|R)
+            echo
+            if [ "$fit_only" -eq 1 ]; then
+                fit_only=0
+            else
+                fit_only=1
+            fi
+            current_page=1
+            apply_filter
+            ;;
+        # Clear an active filter
+        c|C)
+            echo
+            if [ -n "$search_query" ] || [ "$fit_only" -eq 1 ]; then
+                search_query=""
+                fit_only=0
+                current_page=1
+                apply_filter
+            fi
+            ;;
         # Number input - read the rest of the line
         [0-9])
             # Echo the first digit so user can see it
@@ -1086,14 +2019,13 @@ while true; do
 
             # Validate it's a number
             if [[ "$input" =~ ^[0-9]+$ ]]; then
-                selected_idx=$((input - 1))
-
-                # Check if selection is valid (between 1 and total_models)
-                if [ "$input" -ge 1 ] && [ "$input" -le "$total_models" ]; then
-                    selected_model="${model_names[$selected_idx]}"
+                # Numbers are positions in the filtered view, not absolute
+                # indices, so map back through view_idx.
+                if [ "$input" -ge 1 ] && [ "$input" -le "$view_count" ]; then
+                    selected_model="${model_names[${view_idx[$((input - 1))]}]}"
                     break
                 else
-                    print_message "$RED" "❌ Invalid selection. Please enter a number between 1 and $total_models"
+                    print_message "$RED" "❌ Invalid selection. Please enter a number between 1 and $view_count"
                     sleep 1
                 fi
             else
@@ -1121,7 +2053,7 @@ while true; do
             ;;
         *)
             echo
-            print_message "$RED" "❌ Invalid input. Use ←→ arrows, p/n, type number + Enter, or 'q' to quit"
+            print_message "$RED" "❌ Invalid input. Use ←→ arrows, p/n, 'f' to search, type number + Enter, or 'q' to quit"
             sleep 1
             ;;
     esac
