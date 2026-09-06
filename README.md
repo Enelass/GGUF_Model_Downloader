@@ -35,6 +35,7 @@ Donate to support this work: [Ko-fi Enelass](https://ko-fi.com/enelass)
 - **Search and filter**: `[f]` filters the catalog by name or description, `[r]` hides everything that will not run here, and the two compose.
 - **Progressive load**: the table appears in about 10 seconds while per-model sizes keep downloading in the background behind a progress bar; `[u]` folds in whatever has landed so far.
 - **Recover from flaky pulls**: retries `docker model pull` failures automatically, which helps on unreliable or corporate networks.
+- **Survive a proxy that Docker's Model Runner ignores**: when a pull fails because the runner cannot resolve the registry, the script downloads the model itself with curl and installs it into Docker's model store. See [Proxied networks](#proxied-networks).
 - **Inspect local downloads**: scan `~/.docker/models/blobs/sha256/` for completed GGUF blobs, list incomplete downloads separately, and show useful metadata such as role, architecture, size, context length, quantization, tensor count, and cropped path.
 - **Use optional llama.cpp metadata tooling**: detects `llama-gguf` from `brew install llama.cpp`, while still using `gguf_dump` when available. Downloads do not require either tool.
 - **Reuse Docker GGUF blobs elsewhere**: prints Ollama import commands and file locations so downloaded Docker models can be used with Ollama, llama.cpp, or other GGUF-compatible runtimes.
@@ -125,6 +126,36 @@ Everything in the table is derived from public APIs at runtime and cached for 7 
 Caches: `param-ranges-v3.tsv` (one tab-separated record per model: name, parameter range,
 smallest GGUF bytes, that tag, MoE active percentage) and `models-dev.json`. Delete either
 to force a refetch; `[c]` clears filters, not caches.
+
+## Proxied networks
+
+On a network that blocks direct DNS and egress — a corporate MITM proxy, typically —
+`docker model pull` can fail like this even though `docker pull` works fine:
+
+```
+failed to fetch oauth token: Post "https://auth.docker.io/token":
+realm URL rejected: resolving realm hostname "auth.docker.io":
+lookup auth.docker.io: no such host
+```
+
+Docker Desktop's **Model Runner does its own DNS** instead of using the proxy the daemon
+is configured with. The daemon proxies, so image pulls succeed; the runner does not, so
+model pulls fail before a packet leaves the machine.
+
+The script detects this — `no such host`, `realm URL rejected`, `failed to authorize`,
+`proxyconnect`, or an unknown CA — and stops retrying immediately rather than burning ten
+attempts on an error that cannot resolve itself. It then downloads the model directly
+with curl, which *does* honour `HTTPS_PROXY`, and installs it into Docker's own OCI store
+at `~/.docker/models`:
+
+- fetches the manifest and every blob, resuming interrupted transfers with `curl -C -`
+- verifies each blob against the SHA-256 digest that names it, discarding and refetching on mismatch
+- reuses blobs already in the store, so shared licences and weights are never downloaded twice
+- writes atomically (`.part` then `mv`) and backs up `models.json` to `models.json.bak` before touching the index
+
+A model installed this way is indistinguishable from a pulled one — it appears in
+`docker model ls` with correct parameters, quantization and architecture, runs under
+`docker model run`, and removes cleanly with `docker model rm`.
 
 ## Navigation
 

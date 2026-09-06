@@ -9,10 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - GGUF metadata tools are now optional and no longer block browsing or downloading Docker models.
+- Pull failures caused by DNS, proxy, or authorisation problems are no longer retried ten times; they are detected on the first attempt and explained.
 
 ### Added
 - Local downloaded-model checks now list incomplete downloads and offer an optional purge action.
 - Active model downloads can now be cancelled with Ctrl+C, returning to variant selection without stopping Docker Desktop.
+- Fit verdict and estimated tok/s per model, derived from detected hardware, with an `[h]` hardware panel.
+- `[f]` search, `[r]` fits-only filter, and a `[u]` refresh for sizes still arriving in the background.
+- The model table now renders in about ten seconds while remaining sizes download behind a progress bar.
+- Empty Parameters and Description cells are filled from models.dev, without ever overwriting a value Docker provides.
+- Registry fallback: when Docker Desktop's Model Runner cannot reach the registry through a configured proxy, the model is downloaded with curl and installed into `~/.docker/models` — resumable, digest-verified, and indistinguishable from a normal pull.
 
 ## [0.6.0] - 2026-06-15
 

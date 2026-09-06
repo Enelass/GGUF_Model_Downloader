@@ -160,10 +160,203 @@ crop_middle() {
     printf "%s...%s" "${value:0:$prefix_len}" "${value:$((value_len - suffix_len)):$suffix_len}"
 }
 
+# --- Registry fallback -----------------------------------------------------
+#
+# Docker Desktop's Model Runner resolves auth.docker.io itself instead of going
+# through the proxy the daemon is configured with. On a network that blocks
+# direct DNS - a corporate MITM proxy, typically - `docker model pull` fails
+# with "no such host" while ordinary `docker pull` keeps working, because the
+# daemon proxies and the runner does not.
+#
+# curl honours the proxy environment, so we can do the pull ourselves: fetch the
+# manifest, fetch each blob, and write them into the same OCI store the Model
+# Runner reads. Verified end to end - a model installed this way lists under
+# `docker model ls`, runs under `docker model run`, and removes under
+# `docker model rm` exactly like a pulled one.
+#
+# Every write is atomic (".part" then mv within the same directory) and every
+# blob is checked against the digest that names it, so an interrupted run
+# leaves a resumable part file and never a corrupt blob.
+
+model_store_dir() {
+    printf '%s/models' "${DOCKER_CONFIG:-$HOME/.docker}"
+}
+
+# Errors that will never resolve by trying again: the pull did not fail in
+# flight, it failed before a packet left the machine. Retrying these ten times
+# just spends fifty seconds proving the network is still misconfigured.
+is_permanent_pull_failure() {
+    local log="$1"
+    [ -s "$log" ] || return 1
+    grep -qE 'no such host|realm URL rejected|failed to authorize|proxyconnect|certificate signed by unknown authority' "$log" 2>/dev/null
+}
+
+registry_token() {
+    local repo="$1"
+    curl -fsSL --max-time 30 \
+        "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" \
+        2>/dev/null | jq -r '.token // empty' 2>/dev/null || true
+}
+
+# Fetch one blob into the store, resuming a previous attempt if there is one.
+# Returns 0 when the blob is present and its digest checks out.
+registry_fetch_blob() {
+    local repo="$1" digest="$2" token="$3" label="$4"
+    local blobs hex part got
+    blobs="$(model_store_dir)/blobs/sha256"
+    hex="${digest#sha256:}"
+    part="$blobs/.$hex.part"
+
+    if [ -f "$blobs/$hex" ]; then
+        print_message "$GREEN" "  already in store: $label"
+        return 0
+    fi
+
+    mkdir -p "$blobs" 2>/dev/null || true
+    print_message "$YELLOW" "  fetching $label"
+    if ! curl -fL --progress-bar -C - -o "$part" \
+        "https://registry-1.docker.io/v2/${repo}/blobs/${digest}" \
+        -H "Authorization: Bearer $token"; then
+        print_message "$RED" "  transfer failed for $label (partial file kept for resume)"
+        return 1
+    fi
+
+    got=$(shasum -a 256 "$part" 2>/dev/null | awk '{print $1}')
+    if [ "$got" != "$hex" ]; then
+        # A resumed transfer that appended to a stale part file lands here.
+        # The part file is the only suspect, so drop it and let the caller retry
+        # from zero rather than resuming onto known-bad bytes.
+        rm -f "$part" 2>/dev/null || true
+        print_message "$RED" "  checksum mismatch for $label - discarded"
+        return 1
+    fi
+
+    mv -f "$part" "$blobs/$hex" || return 1
+    return 0
+}
+
+registry_pull() {
+    local reference="$1"
+    local repo tag token manifest_file headers digest store files entry attempt
+    local rc=0
+
+    case "$reference" in
+        *:*) repo="${reference%:*}"; tag="${reference##*:}" ;;
+        *)   repo="$reference";      tag="latest" ;;
+    esac
+    case "$repo" in */*) : ;; *) repo="ai/$repo" ;; esac
+
+    store="$(model_store_dir)"
+    if [ ! -d "$store" ]; then
+        print_message "$RED" "Docker model store not found at $store"
+        return 1
+    fi
+
+    echo
+    print_message "$GREEN" "Falling back to a direct registry download via curl (proxy-aware)."
+    print_message "$YELLOW" "Pulling ${repo}:${tag}"
+    echo
+
+    token=$(registry_token "$repo")
+    if [ -z "$token" ]; then
+        print_message "$RED" "Could not obtain a registry token - curl cannot reach auth.docker.io either."
+        print_message "$YELLOW" "Check that your proxy is up: \$HTTPS_PROXY is currently '${HTTPS_PROXY:-unset}'"
+        return 1
+    fi
+
+    manifest_file=$(mktemp -t ddm_manifest) || return 1
+    headers=$(mktemp -t ddm_headers) || return 1
+    if ! curl -fsSL --max-time 30 -D "$headers" -o "$manifest_file" \
+        "https://registry-1.docker.io/v2/${repo}/manifests/${tag}" \
+        -H "Authorization: Bearer $token" \
+        -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'; then
+        print_message "$RED" "Could not fetch the manifest for ${repo}:${tag}"
+        rm -f "$manifest_file" "$headers"
+        return 1
+    fi
+
+    digest=$(shasum -a 256 "$manifest_file" 2>/dev/null | awk '{print $1}')
+    rm -f "$headers"
+    if [ -z "$digest" ]; then
+        rm -f "$manifest_file"
+        return 1
+    fi
+
+    # Config blob first, then layers: the config is tiny and its absence is what
+    # makes `docker model ls` show a model with no metadata.
+    for entry in $(jq -r '.config.digest, .layers[].digest' "$manifest_file" 2>/dev/null); do
+        local label size
+        size=$(jq -r --arg d "$entry" \
+            '[.config, .layers[]] | map(select(.digest == $d)) | .[0].size // 0' \
+            "$manifest_file" 2>/dev/null)
+        label=$(jq -r --arg d "$entry" \
+            '[.config, .layers[]] | map(select(.digest == $d)) | .[0].annotations["org.cncf.model.filepath"] // .[0].mediaType' \
+            "$manifest_file" 2>/dev/null)
+        # format_size_compact rounds anything under half a megabyte to "0MB",
+        # which reads as an error next to a file that is about to download.
+        if [ "${size:-0}" -ge 1048576 ] 2>/dev/null; then
+            label="$label ($(format_size_compact "$size"))"
+        fi
+
+        attempt=0
+        while true; do
+            if registry_fetch_blob "$repo" "$entry" "$token" "$label"; then break; fi
+            attempt=$(( attempt + 1 ))
+            if [ "$attempt" -ge 3 ]; then
+                print_message "$RED" "Giving up on $label after $attempt attempts."
+                rm -f "$manifest_file"
+                return 1
+            fi
+            print_message "$YELLOW" "  retrying ($attempt/3)..."
+            sleep "$DOWNLOAD_RETRY_DELAY_SECONDS"
+            # The token is good for a few minutes; a long blob can outlive it.
+            token=$(registry_token "$repo")
+        done
+    done
+
+    # Only now touch the store's index. Everything above is additive - unnamed
+    # blobs are harmless - so a failure part way through leaves nothing to undo.
+    mkdir -p "$store/manifests/sha256" 2>/dev/null || true
+    cp "$manifest_file" "$store/manifests/sha256/.$digest.part" || { rm -f "$manifest_file"; return 1; }
+    mv -f "$store/manifests/sha256/.$digest.part" "$store/manifests/sha256/$digest" || { rm -f "$manifest_file"; return 1; }
+
+    files=$(jq -c '[.config.digest] + [.layers[].digest]' "$manifest_file" 2>/dev/null)
+    rm -f "$manifest_file"
+    [ -n "$files" ] || return 1
+
+    if [ -f "$store/models.json" ]; then
+        cp -p "$store/models.json" "$store/models.json.bak" 2>/dev/null || true
+    else
+        printf '{"models":[]}\n' > "$store/models.json" 2>/dev/null || true
+    fi
+
+    # Replacing any entry with the same id keeps a re-pull idempotent instead of
+    # appending a duplicate that `docker model ls` would show twice.
+    if jq --arg id "sha256:$digest" \
+          --arg tag "docker.io/${repo}:${tag}" \
+          --argjson files "$files" \
+          '.models |= (map(select(.id != $id)) + [{id: $id, tags: [$tag], files: $files}])' \
+          "$store/models.json" > "$store/.models.json.part" 2>/dev/null; then
+        mv -f "$store/.models.json.part" "$store/models.json"
+    else
+        rm -f "$store/.models.json.part" 2>/dev/null || true
+        print_message "$RED" "Could not update $store/models.json (previous copy kept)."
+        return 1
+    fi
+
+    echo
+    print_message "$GREEN" "✅ Installed ${repo}:${tag} into the Docker model store."
+    print_message "$YELLOW" "Verify with: docker model ls"
+    return 0
+}
+
 pull_model_with_retries() {
     local model_reference="$1"
     local attempt=0
     local status=0
+    local log
+
+    log=$(mktemp -t ddm_pull) || log=""
 
     cancel_active_download() {
         DOWNLOAD_CANCELLED=1
@@ -184,7 +377,14 @@ pull_model_with_retries() {
         fi
 
         trap cancel_active_download INT
-        docker model pull "$model_reference" &
+        if [ -n "$log" ]; then
+            # tee keeps the live output the user expects while giving us a copy
+            # to classify the failure from afterwards.
+            : > "$log"
+            docker model pull "$model_reference" > >(tee "$log") 2>&1 &
+        else
+            docker model pull "$model_reference" &
+        fi
         ACTIVE_PULL_PID=$!
         if wait "$ACTIVE_PULL_PID"; then
             status=0
@@ -193,17 +393,35 @@ pull_model_with_retries() {
         fi
         ACTIVE_PULL_PID=""
         trap - INT
+        # tee is a separate process and may still be draining the pipe.
+        sleep 0.2
 
         if [ "$DOWNLOAD_CANCELLED" -eq 1 ] || [ "$status" -eq 130 ] || [ "$status" -eq 143 ]; then
             print_message "$YELLOW" "Download cancelled."
+            rm -f "$log" 2>/dev/null || true
             return 130
         fi
 
         if [ "$status" -eq 0 ]; then
+            rm -f "$log" 2>/dev/null || true
             return 0
         fi
 
+        if [ -n "$log" ] && is_permanent_pull_failure "$log"; then
+            echo
+            print_message "$RED" "This is not a transient failure - retrying will not help."
+            print_message "$YELLOW" "The Model Runner could not resolve or authorise against the registry."
+            print_message "$YELLOW" "It does its own DNS instead of using the proxy the daemon is configured"
+            print_message "$YELLOW" "with, which is why plain 'docker pull' works and this does not."
+            rm -f "$log" 2>/dev/null || true
+            if registry_pull "$model_reference"; then
+                return 0
+            fi
+            return 1
+        fi
+
         if [ "$attempt" -ge "$DOWNLOAD_MAX_RETRIES" ]; then
+            rm -f "$log" 2>/dev/null || true
             return 1
         fi
 
