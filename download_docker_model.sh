@@ -888,6 +888,10 @@ format_size_compact() {
 # it as $(...), and a subshell assignment would never reach the caller.
 verdict_rank_for() {
     local bytes="$1" need_gb
+    # ".." is the sentinel for a size still being fetched in the background. It
+    # ranks 8 - distinct from 9, "asked and there is no answer" - so the table
+    # can say "not yet" instead of implying the repo ships nothing loadable.
+    case "$bytes" in '..') printf '8'; return 0 ;; esac
     case "$bytes" in ''|-|*[!0-9]*) printf '9'; return 0 ;; esac
 
     need_gb=$(( (bytes / 1073741824) * 115 / 100 + 1 ))
@@ -917,6 +921,7 @@ verdict_for() {
         1) marker='🟡'; text=$(format_size_compact "$bytes") ;;
         2) marker='🟠'; text=$(format_size_compact "$bytes") ;;
         3) marker='❌'; text=$(format_size_compact "$bytes") ;;
+        8) marker='  '; text=".." ;;   # still being fetched
         *) marker='  '; text="-" ;;   # two spaces occupy the same 2 cells
     esac
     printf '%s %-*s' "$marker" "$FIT_CELL_W" "$text"
@@ -936,6 +941,7 @@ verdict_for() {
 TOK_S_CAP=200
 estimate_tok_s() {
     local bytes="$1" active_pct="${2:-100}" eff=65 active_mb ts
+    case "$bytes" in '..') printf '%s' ".."; return 0 ;; esac
     case "$bytes" in ''|-|*[!0-9]*) printf '%s' "-"; return 0 ;; esac
     case "$active_pct" in ''|*[!0-9]*) active_pct=100 ;; esac
     if [ "$HW_BANDWIDTH" -le 0 ]; then printf '%s' "-"; return 0; fi
@@ -1008,6 +1014,189 @@ lookup_param_field() {
     return 0
 }
 
+# --- Background size fetch -------------------------------------------------
+#
+# Verifying which of a repo's tags actually carry loadable GGUF weights costs
+# two or three requests per repo, so filling a cold cache for the whole
+# catalogue takes ~90s. Blocking the table on all of it is the wrong trade: the
+# list of models is useful immediately, and the sizes are what take the time.
+#
+# So the fan-out runs detached. The table renders after a short head start, with
+# ".." in the cells still in flight, and a progress line above the prompt tracks
+# the rest. Pressing [u] folds in whatever has landed.
+PARAM_WARMUP_SECS=10
+PARAM_BG_PID=""
+PARAM_BG_DIR=""
+PARAM_BG_WORKER=""
+PARAM_BG_TOTAL=0
+PARAM_BG_STAMP=0
+PARAM_BG_STATE=""        # "" none | running | ready | merged
+PARAM_TICKS=0
+PARAM_TICK_OFF=0
+
+param_map_has() {
+    case "$PARAM_MAP" in
+        *$'\n'"$1"$'\t'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Workers rename their output into place, so a file being visible here means it
+# is complete. Counting them is the progress signal.
+param_bg_done_count() {
+    local n=0
+    if [ -n "$PARAM_BG_DIR" ] && [ -d "$PARAM_BG_DIR" ]; then
+        n=$(ls -1 "$PARAM_BG_DIR" 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    printf '%s' "$n"
+    return 0
+}
+
+param_bg_poll() {
+    [ "$PARAM_BG_STATE" = "running" ] || return 0
+    if [ -n "$PARAM_BG_PID" ] && kill -0 "$PARAM_BG_PID" 2>/dev/null; then
+        return 0
+    fi
+    PARAM_BG_PID=""
+    PARAM_BG_STATE="ready"
+    return 0
+}
+
+# Fold completed records into the map and rewrite the cache. This runs once
+# after the head start and again on every refresh, so it re-reads records it has
+# already absorbed; keeping the first sighting of each name stops the map
+# growing duplicate copies of them.
+param_bg_absorb() {
+    [ -n "$PARAM_BG_DIR" ] || return 0
+    local merged deduped
+    merged=$(cat "$PARAM_BG_DIR"/* 2>/dev/null || true)
+    [ -n "$merged" ] || return 0
+
+    deduped=$(printf '%s%s\n' "$PARAM_MAP" "$merged" | grep -v '^[[:space:]]*$' \
+        | awk -F'\t' '!seen[$1]++' || true)
+    [ -n "$deduped" ] || return 0
+    PARAM_MAP=$'\n'"$deduped"$'\n'
+
+    {
+        printf '%s\n' "$PARAM_BG_STAMP"
+        printf '%s\n' "$deduped"
+    } > "$PARAM_CACHE_FILE" 2>/dev/null || true
+    return 0
+}
+
+param_bg_cleanup() {
+    if [ -n "${PARAM_BG_PID:-}" ]; then
+        # Kill the workers before their xargs parent, or they are reparented and
+        # outlive the session still holding sockets open.
+        pkill -P "$PARAM_BG_PID" 2>/dev/null || true
+        kill "$PARAM_BG_PID" 2>/dev/null || true
+        PARAM_BG_PID=""
+    fi
+    if [ -n "${PARAM_BG_DIR:-}" ]; then
+        rm -rf "$PARAM_BG_DIR" "${PARAM_BG_WORKER:-}" 2>/dev/null || true
+        PARAM_BG_DIR=""
+        PARAM_BG_WORKER=""
+    fi
+    return 0
+}
+
+populate_param_arrays() {
+    local i
+    model_params=()
+    model_minbytes=()
+    model_mintag=()
+    model_active=()
+    for (( i=0; i<total_models; i++ )); do
+        if [ "$PARAM_BG_STATE" = "running" ] && ! param_map_has "${model_names[$i]}"; then
+            # Still in flight. ".." is deliberately ASCII: printf pads by bytes,
+            # so a one-cell ellipsis character would shift the column.
+            model_params+=("..")
+            model_minbytes+=("..")
+            model_mintag+=("-")
+            model_active+=("-")
+            continue
+        fi
+        model_params+=("$(lookup_param_field "${model_names[$i]}" 1)")
+        model_minbytes+=("$(lookup_param_field "${model_names[$i]}" 2)")
+        model_mintag+=("$(lookup_param_field "${model_names[$i]}" 3)")
+        model_active+=("$(lookup_param_field "${model_names[$i]}" 4)")
+    done
+    return 0
+}
+
+# [u]. Merging partial results is deliberate: a user who wants to see what has
+# arrived so far should not have to wait for the slowest repo in the batch.
+param_bg_refresh() {
+    param_bg_poll
+    [ -n "$PARAM_BG_DIR" ] || return 0
+    param_bg_absorb
+    if [ "$PARAM_BG_STATE" = "ready" ]; then
+        PARAM_BG_STATE="merged"
+        rm -rf "$PARAM_BG_DIR" "$PARAM_BG_WORKER" 2>/dev/null || true
+        PARAM_BG_DIR=""
+        PARAM_BG_WORKER=""
+    fi
+    populate_param_arrays
+    fill_gaps_from_models_dev "$total_models" || true
+    apply_filter
+    return 0
+}
+
+# The progress line occupies the blank line immediately above the prompt, which
+# lets it be rewritten in place with a cursor save/restore. Redrawing the whole
+# table once a second to advance a bar would flicker every row.
+PARAM_BAR_W=20
+param_progress_body() {
+    local ndone total filled i bar=""
+    case "$PARAM_BG_STATE" in
+        running)
+            ndone=$(param_bg_done_count)
+            total="$PARAM_BG_TOTAL"
+            if [ "$total" -le 0 ]; then total=1; fi
+            if [ "$ndone" -gt "$total" ]; then ndone="$total"; fi
+            filled=$(( ndone * PARAM_BAR_W / total ))
+            i=0
+            while [ "$i" -lt "$PARAM_BAR_W" ]; do
+                if [ "$i" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar}░"; fi
+                i=$(( i + 1 ))
+            done
+            printf "${CYAN}  Sizing models  [%s] %s/%s  ·  [u] refresh${NC}" \
+                "$bar" "$ndone" "$total"
+            ;;
+        ready)
+            printf "${GREEN}  Sizes ready  ·  press [u] to refresh the table${NC}"
+            ;;
+        *)
+            : ;;
+    esac
+    return 0
+}
+
+param_progress_line() {
+    param_bg_poll
+    param_progress_body
+    printf '\n'
+    return 0
+}
+
+param_progress_tick() {
+    param_bg_poll
+    printf '\033[s\033[1A\r\033[2K'
+    param_progress_body
+    printf '\033[u'
+    return 0
+}
+
+# Empty means "block on the keyboard". A one-second timeout is only used while
+# there is a bar to advance, so an idle table costs nothing.
+param_tick_timeout() {
+    if [ "$PARAM_TICK_OFF" -eq 0 ] && [ "$PARAM_BG_STATE" = "running" ]; then
+        printf '1'
+    fi
+    return 0
+}
+
 fetch_param_ranges() {
     model_params=()
     model_minbytes=()
@@ -1059,8 +1248,14 @@ fetch_param_ranges() {
 #!/bin/bash
 name="$1"
 out="$2/$1"
-tags=$(curl -fsSL "https://hub.docker.com/v2/repositories/ai/${name}/tags?page_size=100" -H 'accept: */*' 2>/dev/null | jq -r '.results[] | "\(.name)\t\(.full_size // 0)"' 2>/dev/null || true)
-[ -z "$tags" ] && { printf '%s\t-\t-\t-\t-\n' "$name" > "$out"; exit 0; }
+# The table renders while this fan-out is still running, so a half-written
+# record must never be visible to the merge. Write to a dotfile, which the
+# merge glob skips, then rename - atomic within a directory.
+tmp="$2/.$1.part"
+# Every request is bounded: this runs detached, and an unbounded curl would
+# outlive the session it belongs to.
+tags=$(curl -fsSL --max-time 20 "https://hub.docker.com/v2/repositories/ai/${name}/tags?page_size=100" -H 'accept: */*' 2>/dev/null | jq -r '.results[] | "\(.name)\t\(.full_size // 0)"' 2>/dev/null || true)
+[ -z "$tags" ] && { printf '%s\t-\t-\t-\t-\n' "$name" > "$tmp"; mv -f "$tmp" "$out"; exit 0; }
 
 # Parameter range, parsed from the tag names.
 range=$(printf '%s\n' "$tags" | awk -F'\t' '
@@ -1112,12 +1307,12 @@ case "$name" in
 esac
 token=""
 if [ -n "$cands" ]; then
-    token=$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ai/${name}:pull" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || true)
+    token=$(curl -fsSL --max-time 20 "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ai/${name}:pull" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || true)
 fi
 if [ -n "$token" ] && [ -n "$cands" ]; then
     while IFS='	' read -r csize ctag; do
         [ -n "$ctag" ] || continue
-        files=$(curl -fsSL "https://registry-1.docker.io/v2/ai/${name}/manifests/${ctag}" \
+        files=$(curl -fsSL --max-time 20 "https://registry-1.docker.io/v2/ai/${name}/manifests/${ctag}" \
             -H "Authorization: Bearer $token" \
             -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.cncf.model.manifest.v1+json' \
             2>/dev/null | jq -r '.layers[]? | .annotations["org.cncf.model.filepath"] // empty' 2>/dev/null || true)
@@ -1173,39 +1368,45 @@ if [ "$gtag" != "-" ]; then
     [ -n "$active" ] || active="-"
 fi
 
-printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$range" "$gmin" "$gtag" "$active" > "$out"
+printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$range" "$gmin" "$gtag" "$active" > "$tmp"
+mv -f "$tmp" "$out"
 WORKER
         chmod +x "$worker"
 
-        xargs -P "$PARAM_FETCH_JOBS" -I{} "$worker" {} "$out_dir" < "$missing_file" 2>/dev/null || true
+        # Detached, so the table can render before this finishes. The head start
+        # is there because a warm-ish cache often completes inside it, and
+        # flashing ".." for a second on a list that is about to be complete is
+        # worse than simply waiting for it.
+        xargs -P "$PARAM_FETCH_JOBS" -I{} "$worker" {} "$out_dir" < "$missing_file" >/dev/null 2>&1 &
+        PARAM_BG_PID=$!
+        PARAM_BG_DIR="$out_dir"
+        PARAM_BG_WORKER="$worker"
+        PARAM_BG_TOTAL="$missing_count"
+        PARAM_BG_STAMP="$now"
+        PARAM_BG_STATE="running"
 
-        # Merge freshly fetched entries into the map.
-        local merged
-        merged=$(cat "$out_dir"/* 2>/dev/null || true)
-        if [ -n "$merged" ]; then
-            PARAM_MAP="${PARAM_MAP}${merged}"$'\n'
-        fi
+        local waited=0
+        while [ "$waited" -lt "$PARAM_WARMUP_SECS" ]; do
+            if kill -0 "$PARAM_BG_PID" 2>/dev/null; then : ; else break; fi
+            sleep 1
+            waited=$(( waited + 1 ))
+        done
 
-        # Rewrite the cache: timestamp line, then every known entry.
-        {
-            printf '%s\n' "$now"
-            printf '%s' "$PARAM_MAP" | grep -v '^$' || true
-        } > "$PARAM_CACHE_FILE" 2>/dev/null || true
-
-        rm -rf "$out_dir" "$worker" 2>/dev/null || true
         stop_spinner
+        param_bg_poll
+        param_bg_absorb
+        if [ "$PARAM_BG_STATE" = "ready" ]; then
+            # It finished inside the head start, so there is nothing to refresh.
+            PARAM_BG_STATE="merged"
+            rm -rf "$out_dir" "$worker" 2>/dev/null || true
+            PARAM_BG_DIR=""
+            PARAM_BG_WORKER=""
+        fi
     fi
 
     rm -f "$missing_file" 2>/dev/null || true
 
-    for (( i=0; i<total_models; i++ )); do
-        local rec
-        rec=$(lookup_param_field "${model_names[$i]}" 1)
-        model_params+=("$rec")
-        model_minbytes+=("$(lookup_param_field "${model_names[$i]}" 2)")
-        model_mintag+=("$(lookup_param_field "${model_names[$i]}" 3)")
-        model_active+=("$(lookup_param_field "${model_names[$i]}" 4)")
-    done
+    populate_param_arrays
 
     fill_gaps_from_models_dev "$total_models" || true
 
@@ -1524,6 +1725,14 @@ total_models=${#model_names[@]}
 current_page=1
 
 detect_hardware
+
+# fetch_param_ranges leaves a detached fan-out running, so it needs a teardown
+# in place before it starts. The fuller traps installed further down (which also
+# restore the terminal) replace these once those functions exist.
+trap 'param_bg_cleanup' EXIT
+trap 'param_bg_cleanup; exit 130' INT
+trap 'param_bg_cleanup; exit 143' TERM
+
 fetch_param_ranges
 
 # Search / filter state.
@@ -1673,6 +1882,7 @@ show_hardware_panel() {
     printf "   %s  %s\n" "🟠" "over the accelerator budget; runs on CPU instead, slowly"
     printf "   %s  %s\n" "❌" "larger than total memory - will not run"
     printf "   %s  %s\n" " -" "no GGUF build published, so no verdict"
+    printf "   %s  %s\n" " .." "size still being fetched - press [u] to fold it in"
     echo
     print_message "$YELLOW" "The size shown is the smallest GGUF build the repo ships, so it is the"
     print_message "$YELLOW" "best case; larger quantisations of the same model will need more."
@@ -1804,10 +2014,14 @@ display_page() {
         if [ "$fit_only" -eq 1 ]; then
             fit_label="Show all"
         fi
+        local refresh_hint=""
+        if [ -n "$PARAM_BG_DIR" ]; then
+            refresh_hint="  [u] Refresh sizes"
+        fi
         if [ -n "$search_query" ] || [ "$fit_only" -eq 1 ]; then
-            print_message "$YELLOW" "Navigation: [←] Prev  [→] Next  [f] Search  [r] $fit_label  [h] Hardware  [c] Clear  [1-$view_count + Enter] Select  [q] Quit"
+            print_message "$YELLOW" "Navigation: [←] Prev  [→] Next  [f] Search  [r] $fit_label  [h] Hardware  [c] Clear${refresh_hint}  [1-$view_count + Enter] Select  [q] Quit"
         else
-            print_message "$YELLOW" "Navigation: [←] Prev  [→] Next  [f] Search  [r] $fit_label  [h] Hardware  [1-$view_count + Enter] Select  [q] Quit"
+            print_message "$YELLOW" "Navigation: [←] Prev  [→] Next  [f] Search  [r] $fit_label  [h] Hardware${refresh_hint}  [1-$view_count + Enter] Select  [q] Quit"
         fi
     fi
     print_message "$YELLOW" "$sep"
@@ -1833,10 +2047,11 @@ search_key_end() {
 }
 
 # Non-canonical mode must always be handed back, including on Ctrl-C, or the
-# user is dropped into a shell with no echo.
-trap 'search_key_end' EXIT
-trap 'search_key_end; exit 130' INT
-trap 'search_key_end; exit 143' TERM
+# user is dropped into a shell with no echo. The background size fetch is torn
+# down here too, so quitting mid-fetch does not leave workers running.
+trap 'search_key_end; param_bg_cleanup' EXIT
+trap 'search_key_end; param_bg_cleanup; exit 130' INT
+trap 'search_key_end; param_bg_cleanup; exit 143' TERM
 
 search_key_read() {
     local key rest
@@ -1919,10 +2134,32 @@ run_search() {
     return 0
 }
 
-# Function to read a single keypress including arrow keys
+# Function to read a single keypress including arrow keys. With a timeout
+# argument it reports TIMEOUT instead of blocking, which is how the progress bar
+# gets a chance to advance while the user is deciding.
 read_key() {
-    local key
-    IFS= read -rsn1 key 2>/dev/null
+    local key started timeout="${1:-}"
+
+    if [ -n "$timeout" ]; then
+        started=$SECONDS
+        if IFS= read -rsn1 -t "$timeout" key 2>/dev/null; then
+            :
+        else
+            # bash 4 returns >128 for a expired timer and 1 for end of input,
+            # but bash 3.2 - which is what macOS ships - returns 1 for both.
+            # The elapsed time separates them instead: a timeout waits out its
+            # full second, whereas a closed stdin comes back instantly. Getting
+            # this wrong would spin the tick loop at full speed on a pipe.
+            if [ $(( SECONDS - started )) -ge 1 ]; then
+                echo "TIMEOUT"
+            else
+                echo "EOF"
+            fi
+            return 0
+        fi
+    else
+        IFS= read -rsn1 key 2>/dev/null
+    fi
 
     # Check if it's an escape sequence (arrow keys)
     if [[ $key == $'\x1b' ]]; then
@@ -1948,11 +2185,32 @@ selected_ollama_model=""
 while true; do
     display_page
 
-    echo
+    param_progress_line
     printf "Enter choice: "
 
-    # Read first character to detect arrow keys or regular input
-    first_char=$(read_key)
+    # While sizes are still landing, wake once a second and advance the bar in
+    # place rather than looping back to display_page, which would repaint every
+    # row of the table a second at a time.
+    first_char=""
+    while true; do
+        first_char=$(read_key "$(param_tick_timeout)")
+        if [ "$first_char" = "EOF" ]; then
+            # Nobody is at the keyboard. Stop ticking and let the usual
+            # end-of-input handling below take over.
+            PARAM_TICK_OFF=1
+            first_char=""
+            break
+        fi
+        if [ "$first_char" != "TIMEOUT" ]; then
+            break
+        fi
+        PARAM_TICKS=$(( PARAM_TICKS + 1 ))
+        # Belt and braces against any other source of instant timeouts.
+        if [ "$PARAM_TICKS" -gt 900 ]; then
+            PARAM_TICK_OFF=1
+        fi
+        param_progress_tick
+    done
 
     case "$first_char" in
         # Arrow keys for navigation
@@ -1998,6 +2256,13 @@ while true; do
             fi
             current_page=1
             apply_filter
+            ;;
+        # Fold in sizes fetched in the background
+        u|U)
+            echo
+            if [ -n "$PARAM_BG_DIR" ]; then
+                param_bg_refresh
+            fi
             ;;
         # Clear an active filter
         c|C)
